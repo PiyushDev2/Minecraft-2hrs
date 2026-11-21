@@ -1,0 +1,6 @@
+{
+  "name": "VoxelCraft Backend Engine",
+  "description": "Modular browser-based Minecraft-style voxel world engine with procedural biomes, 16x16 chunk management, greedy meshing, DDA raycasting, player AABB physics, and save/load persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
