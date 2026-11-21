@@ -4,7 +4,7 @@
  * guards, deduplicated per-chunk job queueing, and graceful fallback when Workers are unavailable.
  */
 
-import { getChunkKey } from './Chunk.js';
+import { getChunkKey } from './ChunkConstants.js';
 import { buildChunkGeometryBuffers } from './MeshingCore.js';
 
 /**
@@ -82,11 +82,15 @@ export class MeshWorkerPool {
         return;
       }
 
-      const slot = { worker, busy: false, currentJob: null };
+      const slot = { worker, busy: false, failed: false, currentJob: null };
       worker.onmessage = (ev) => this._handleWorkerMessage(slot, ev.data);
       worker.onerror = () => this._handleWorkerError(slot);
-      worker.postMessage({ type: 'init', blockTable, tileRects });
-      this._slots.push(slot);
+      try {
+        worker.postMessage({ type: 'init', blockTable, tileRects });
+        this._slots.push(slot);
+      } catch {
+        worker.terminate?.();
+      }
     }
 
     this.active = this._slots.length > 0;
@@ -179,6 +183,7 @@ export class MeshWorkerPool {
         const built = buildChunkGeometryBuffers({
           getBlockAtLocal: (lx, y, lz) => region.getBlock(lx, y, lz),
           getLightAtLocal: (lx, y, lz) => region.getLight(lx, y, lz),
+          getFluidLevelAtLocal: (lx, y, lz) => region.getFluidLevel(lx, y, lz),
           blockTable: this.blockRegistry.exportMesherTable(),
           tileRects: this.textureAtlas.exportTileRects(),
         });
@@ -208,7 +213,7 @@ export class MeshWorkerPool {
    */
   _pump() {
     while (this._pendingQueue.length > 0) {
-      const idleSlot = this._slots.find((s) => !s.busy);
+      const idleSlot = this._slots.find((s) => !s.busy && !s.failed);
       if (!idleSlot) break;
 
       const job = this._pendingQueue.shift();
@@ -219,20 +224,25 @@ export class MeshWorkerPool {
       this._inFlightKeys.add(job.key);
 
       const { region } = job;
-      idleSlot.worker.postMessage(
-        {
-          type: 'mesh',
-          jobId: job.jobId,
-          epoch: job.epoch,
-          chunkX: region.chunkX,
-          chunkZ: region.chunkZ,
-          centerEditVersion: region.centerEditVersion,
-          versionSignature: region.versionSignature,
-          blocks: region.blocks,
-          lightData: region.lightData,
-        },
-        [region.blocks.buffer, region.lightData.buffer]
-      );
+      try {
+        idleSlot.worker.postMessage(
+          {
+            type: 'mesh',
+            jobId: job.jobId,
+            epoch: job.epoch,
+            chunkX: region.chunkX,
+            chunkZ: region.chunkZ,
+            centerEditVersion: region.centerEditVersion,
+            versionSignature: region.versionSignature,
+            blocks: region.blocks,
+            lightData: region.lightData,
+            fluidData: region.fluidData,
+          },
+          [region.blocks.buffer, region.lightData.buffer, region.fluidData.buffer]
+        );
+      } catch {
+        this._handleWorkerError(idleSlot);
+      }
     }
   }
 
@@ -249,12 +259,14 @@ export class MeshWorkerPool {
       this._inFlightKeys.delete(job.key);
     }
 
-    if (!this.disposed && msg && msg.type === 'result' && job) {
+    if (!this.disposed && msg && job) {
       const isCurrentEpoch = msg.epoch === this.epoch;
       const key = getChunkKey(msg.chunkX, msg.chunkZ);
       const isLatestJob = this._latestJobByChunkKey.get(key) === msg.jobId;
 
-      if (isCurrentEpoch && isLatestJob && typeof job.onResult === 'function') {
+      if (msg.type === 'result' && isCurrentEpoch && isLatestJob && typeof job.onResult === 'function') {
+        job.onResult(msg);
+      } else if (msg.type === 'error' && isCurrentEpoch && typeof job.onResult === 'function') {
         job.onResult(msg);
       }
     }
@@ -268,11 +280,50 @@ export class MeshWorkerPool {
   _handleWorkerError(slot) {
     const job = slot.currentJob;
     slot.busy = false;
+    slot.failed = true;
     slot.currentJob = null;
+    try {
+      slot.worker?.terminate?.();
+    } catch {
+      // Ignore termination errors
+    }
+
     if (job) {
       this._inFlightKeys.delete(job.key);
+      if (!this.disposed && job.epoch === this.epoch && typeof job.onResult === 'function') {
+        job.onResult({
+          type: 'error',
+          jobId: job.jobId,
+          epoch: job.epoch,
+          chunkX: job.region.chunkX,
+          chunkZ: job.region.chunkZ,
+          centerEditVersion: job.region.centerEditVersion,
+          versionSignature: job.region.versionSignature,
+          error: 'Worker slot failed',
+        });
+      }
     }
-    if (!this.disposed) {
+
+    const healthySlots = this._slots.filter((s) => !s.failed);
+    if (healthySlots.length === 0) {
+      this.active = false;
+      // Drain remaining pending jobs synchronously via fallback callback
+      while (this._pendingQueue.length > 0) {
+        const pending = this._pendingQueue.shift();
+        if (pending && pending.epoch === this.epoch && typeof pending.onResult === 'function') {
+          pending.onResult({
+            type: 'error',
+            jobId: pending.jobId,
+            epoch: pending.epoch,
+            chunkX: pending.region.chunkX,
+            chunkZ: pending.region.chunkZ,
+            centerEditVersion: pending.region.centerEditVersion,
+            versionSignature: pending.region.versionSignature,
+            error: 'No healthy worker slots remaining',
+          });
+        }
+      }
+    } else if (!this.disposed) {
       this._pump();
     }
   }

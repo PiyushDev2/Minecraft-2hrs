@@ -32,6 +32,11 @@ export const BLOCK_IDS = Object.freeze({
   FLOWER: 17,
   SPRUCE_LOG: 18,
   SPRUCE_LEAVES: 19,
+  OAK_PLANKS: 20,
+  COBBLESTONE: 21,
+  CRAFTING_TABLE: 22,
+  GLASS: 23,
+  BRICKS: 24,
 });
 
 /**
@@ -515,6 +520,77 @@ export function createDefaultBlockRegistry(registry = new BlockRegistry()) {
     color: 0x2d5836,
     occludesFaces: false,
     lightAttenuation: 2,
+  });
+
+  registry.register({
+    id: BLOCK_IDS.OAK_PLANKS,
+    key: 'oak_planks',
+    name: 'Oak Planks',
+    textures: { all: 'planks_oak' },
+    solid: true,
+    transparent: false,
+    liquid: false,
+    breakable: true,
+    hardness: 2.0,
+    color: 0xb48a55,
+  });
+
+  registry.register({
+    id: BLOCK_IDS.COBBLESTONE,
+    key: 'cobblestone',
+    name: 'Cobblestone',
+    textures: { all: 'cobblestone' },
+    solid: true,
+    transparent: false,
+    liquid: false,
+    breakable: true,
+    hardness: 2.0,
+    color: 0x6c6e70,
+  });
+
+  registry.register({
+    id: BLOCK_IDS.CRAFTING_TABLE,
+    key: 'crafting_table',
+    name: 'Crafting Table',
+    textures: {
+      top: 'crafting_table_top',
+      bottom: 'planks_oak',
+      side: 'crafting_table_side',
+    },
+    solid: true,
+    transparent: false,
+    liquid: false,
+    breakable: true,
+    hardness: 2.5,
+    color: 0x9b6b3e,
+  });
+
+  registry.register({
+    id: BLOCK_IDS.GLASS,
+    key: 'glass',
+    name: 'Glass',
+    textures: { all: 'glass' },
+    solid: true,
+    transparent: true,
+    liquid: false,
+    breakable: true,
+    hardness: 0.3,
+    color: 0xd0eef9,
+    occludesFaces: false,
+    lightAttenuation: 1,
+  });
+
+  registry.register({
+    id: BLOCK_IDS.BRICKS,
+    key: 'bricks',
+    name: 'Bricks',
+    textures: { all: 'bricks' },
+    solid: true,
+    transparent: false,
+    liquid: false,
+    breakable: true,
+    hardness: 2.0,
+    color: 0x9e4b3c,
   });
 
   return registry;

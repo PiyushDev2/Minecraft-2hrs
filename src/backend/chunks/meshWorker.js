@@ -51,6 +51,7 @@ self.onmessage = (event) => {
       chunkZ: msg.chunkZ,
       blocks: msg.blocks,
       lightData: msg.lightData,
+      fluidData: msg.fluidData,
       centerEditVersion: msg.centerEditVersion,
       versionSignature: msg.versionSignature,
     });
@@ -58,6 +59,7 @@ self.onmessage = (event) => {
     const built = buildChunkGeometryBuffers({
       getBlockAtLocal: (lx, y, lz) => region.getBlock(lx, y, lz),
       getLightAtLocal: (lx, y, lz) => region.getLight(lx, y, lz),
+      getFluidLevelAtLocal: (lx, y, lz) => region.getFluidLevel(lx, y, lz),
       blockTable: cachedBlockTable,
       tileRects: cachedTileRects,
     });

@@ -7,7 +7,7 @@
 
 import { BlockFace } from '../blocks/Block.js';
 import { BLOCK_IDS } from '../blocks/BlockRegistry.js';
-import { CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH } from './Chunk.js';
+import { CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH } from './ChunkConstants.js';
 
 const FACE_SHADE = Object.freeze({
   [BlockFace.TOP]: 1.0,
@@ -86,6 +86,7 @@ const INV_SQRT2 = Math.SQRT1_2;
  * @param {Object} params
  * @param {(lx: number, y: number, lz: number) => number} params.getBlockAtLocal
  * @param {(lx: number, y: number, lz: number) => { sky: number, block: number }} params.getLightAtLocal
+ * @param {(lx: number, y: number, lz: number) => number} [params.getFluidLevelAtLocal]
  * @param {Array<{ occludesFaces: boolean, lightEmission: number, crossPlant: boolean, textures: Record<string, string|null> }|null>} params.blockTable
  * @param {Record<string, { u0: number, v0: number, uSize: number, vSize: number }>} params.tileRects
  * @returns {{ opaque: Object|null, water: Object|null, faceCount: number, triangleCount: number }}
@@ -93,12 +94,14 @@ const INV_SQRT2 = Math.SQRT1_2;
 export function buildChunkGeometryBuffers({
   getBlockAtLocal,
   getLightAtLocal,
+  getFluidLevelAtLocal = () => 0,
   blockTable,
   tileRects,
 }) {
   const opaque = runGreedyPass({
     getBlockAtLocal,
     getLightAtLocal,
+    getFluidLevelAtLocal,
     blockTable,
     tileRects,
     waterPass: false,
@@ -107,6 +110,7 @@ export function buildChunkGeometryBuffers({
   const water = runGreedyPass({
     getBlockAtLocal,
     getLightAtLocal,
+    getFluidLevelAtLocal,
     blockTable,
     tileRects,
     waterPass: true,
@@ -156,7 +160,14 @@ function computeFaceAO(neighborCoord, uAxis, vAxis, getBlockAtLocal, blockTable)
 /**
  * Executes 3D greedy meshing + cross-plant flora emission and returns TypedArrays.
  */
-function runGreedyPass({ getBlockAtLocal, getLightAtLocal, blockTable, tileRects, waterPass }) {
+function runGreedyPass({
+  getBlockAtLocal,
+  getLightAtLocal,
+  getFluidLevelAtLocal,
+  blockTable,
+  tileRects,
+  waterPass,
+}) {
   const positions = [];
   const normals = [];
   const uvs = [];
@@ -241,6 +252,17 @@ function runGreedyPass({ getBlockAtLocal, getLightAtLocal, blockTable, tileRects
           const skyLight = nLight.sky;
           const blockLight = Math.max(nLight.block, def.lightEmission || 0);
 
+          let waterTopOffset = 0;
+          if (waterPass) {
+            const aboveId = getBlockAtLocal(coord[0], coord[1] + 1, coord[2]);
+            if (aboveId !== BLOCK_IDS.WATER && face !== BlockFace.BOTTOM) {
+              const meta = getFluidLevelAtLocal(coord[0], coord[1], coord[2]);
+              const isFalling = (meta & 0x10) !== 0;
+              const dist = isFalling ? 0 : meta & 0x0f;
+              waterTopOffset = dist === 0 ? -0.12 : -Math.min(0.86, 0.12 + dist * 0.105);
+            }
+          }
+
           mask[maskIdx] = {
             blockId,
             ao0: ao[0],
@@ -249,7 +271,8 @@ function runGreedyPass({ getBlockAtLocal, getLightAtLocal, blockTable, tileRects
             ao3: ao[3],
             skyLight,
             blockLight,
-            key: `${blockId}|${ao[0]}${ao[1]}${ao[2]}${ao[3]}|${skyLight}|${blockLight}`,
+            waterTopOffset,
+            key: `${blockId}|${ao[0]}${ao[1]}${ao[2]}${ao[3]}|${skyLight}|${blockLight}|${waterTopOffset}`,
           };
           hasAnyFace = true;
         }
@@ -288,7 +311,7 @@ function runGreedyPass({ getBlockAtLocal, getLightAtLocal, blockTable, tileRects
           const tileKey = def?.textures?.[face] || 'stone';
           const rect = tileRects[tileKey] || fallbackRect;
           const faceShade = FACE_SHADE[face] ?? 1.0;
-          const waterTopOffset = waterPass && face === BlockFace.TOP ? -0.12 : 0;
+          const waterTopOffset = cell.waterTopOffset;
 
           const c0 = [0, 0, 0];
           const c1 = [0, 0, 0];
@@ -301,10 +324,16 @@ function runGreedyPass({ getBlockAtLocal, getLightAtLocal, blockTable, tileRects
           c3[axis] = planePos; c3[uAxis] = u;     c3[vAxis] = v + h;
 
           if (waterTopOffset !== 0) {
-            c0[1] += waterTopOffset;
-            c1[1] += waterTopOffset;
-            c2[1] += waterTopOffset;
-            c3[1] += waterTopOffset;
+            if (face === BlockFace.TOP) {
+              c0[1] += waterTopOffset;
+              c1[1] += waterTopOffset;
+              c2[1] += waterTopOffset;
+              c3[1] += waterTopOffset;
+            } else if (axis !== 1) {
+              // Lower only the top edge (vAxis === 1 -> c2 & c3) of surface-layer side walls
+              c2[1] += waterTopOffset;
+              c3[1] += waterTopOffset;
+            }
           }
 
           positions.push(

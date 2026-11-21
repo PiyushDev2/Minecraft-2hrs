@@ -21,8 +21,8 @@ export class World {
    * @param {number|string} [options.seed=1337]
    * @param {number} [options.viewDistance=5]
    * @param {import('../blocks/BlockRegistry.js').BlockRegistry} [options.registry]
-   * @param {number} [options.maxChunksGeneratedPerFrame=2]
-   * @param {number} [options.maxChunksMeshedPerFrame=3]
+   * @param {number} [options.maxChunksGeneratedPerFrame=4]
+   * @param {number} [options.maxChunksMeshedPerFrame=6]
    * @param {number} [options.dayLengthSeconds=600]
    * @param {number} [options.initialTimeOfDay=0.25]
    * @param {boolean} [options.useWorkers=true]
@@ -31,8 +31,8 @@ export class World {
     seed = 1337,
     viewDistance = 5,
     registry = blockRegistry,
-    maxChunksGeneratedPerFrame = 2,
-    maxChunksMeshedPerFrame = 3,
+    maxChunksGeneratedPerFrame = 4,
+    maxChunksMeshedPerFrame = 6,
     dayLengthSeconds = 600,
     initialTimeOfDay = 0.25,
     useWorkers = true,
@@ -62,6 +62,8 @@ export class World {
     });
     /** @type {import('../lighting/LightEngine.js').LightEngine|null} */
     this.lightEngine = this.chunkManager.lightEngine;
+    /** @type {import('../fluid/FluidSimulator.js').FluidSimulator|null} */
+    this.fluidSimulator = this.chunkManager.fluidSimulator;
 
     /** @type {Set<(event: { x: number, y: number, z: number, previousId: number, blockId: number }) => void>} */
     this._onBlockChanged = new Set();
@@ -129,7 +131,7 @@ export class World {
   }
 
   /**
-   * Updates view-distance streaming, day/night sky brightness, and remeshing around a world position.
+   * Updates view-distance streaming, day/night sky brightness, fluid simulation, and remeshing.
    * @param {{ x: number, y?: number, z: number }} [focusPosition={ x: 8, z: 8 }]
    * @param {number} [deltaTime=0]
    */
@@ -140,6 +142,7 @@ export class World {
     } else {
       this.chunkMesher.setSkyBrightness(this.getSkyBrightness());
     }
+    this.fluidSimulator?.update(deltaTime);
     this.chunkManager.update(focusPosition.x, focusPosition.z);
   }
 
@@ -155,6 +158,28 @@ export class World {
   }
 
   /**
+   * Returns true if block at world coordinates (x, y, z) is solid.
+   * @param {number} x
+   * @param {number} y
+   * @param {number} z
+   * @returns {boolean}
+   */
+  isSolidAt(x, y, z) {
+    return this.blockRegistry.isSolid(this.getBlock(x, y, z));
+  }
+
+  /**
+   * Returns true if block at world coordinates (x, y, z) is liquid (e.g. water).
+   * @param {number} x
+   * @param {number} y
+   * @param {number} z
+   * @returns {boolean}
+   */
+  isLiquidAt(x, y, z) {
+    return this.blockRegistry.isLiquid(this.getBlock(x, y, z));
+  }
+
+  /**
    * Returns dual-bank { sky, block } light levels (0..15) at world coordinates (x, y, z).
    * @param {number} x
    * @param {number} y
@@ -166,15 +191,37 @@ export class World {
   }
 
   /**
+   * Gets fluid metadata byte at world coordinates (x, y, z).
+   * @param {number} x
+   * @param {number} y
+   * @param {number} z
+   * @returns {number}
+   */
+  getFluidLevel(x, y, z) {
+    return this.chunkManager.getFluidLevel(x, y, z);
+  }
+
+  /**
+   * Executes one deterministic fluid simulation step (useful for testing/scripting).
+   * @param {number} [maxUpdates]
+   * @returns {number}
+   */
+  stepFluids(maxUpdates) {
+    return this.fluidSimulator ? this.fluidSimulator.step(maxUpdates) : 0;
+  }
+
+  /**
    * Sets block ID at world coordinates (x, y, z) and notifies listeners.
+   * Immediately updates nearby chunk meshes by default so block break/place edits have zero visual lag.
    * @param {number} x
    * @param {number} y
    * @param {number} z
    * @param {number} blockId
    * @param {boolean} [recordModification=true]
+   * @param {boolean} [immediateRemesh=true]
    * @returns {boolean}
    */
-  setBlock(x, y, z, blockId, recordModification = true) {
+  setBlock(x, y, z, blockId, recordModification = true, immediateRemesh = true) {
     const ix = Math.floor(x);
     const iy = Math.floor(y);
     const iz = Math.floor(z);
@@ -186,6 +233,10 @@ export class World {
     const previousId = this.getBlock(ix, iy, iz);
     const changed = this.chunkManager.setBlock(ix, iy, iz, blockId, recordModification);
     if (!changed) return false;
+
+    if (immediateRemesh && recordModification) {
+      this.chunkManager.remeshNeighborhoodForBlock(ix, iz);
+    }
 
     for (const cb of this._onBlockChanged) {
       cb({ x: ix, y: iy, z: iz, previousId, blockId });
@@ -444,8 +495,12 @@ export class World {
 
   /**
    * Returns live engine diagnostics for debugging/HUD inspection.
+   * @param {{ x: number, z: number }} [focusPosition]
    */
-  getStats() {
+  getStats(focusPosition = undefined) {
+    const streaming = focusPosition
+      ? this.chunkManager.getStreamingProgress(focusPosition.x, focusPosition.z)
+      : null;
     return {
       seed: this.seed,
       loadedChunks: this.chunkManager.chunks.size,
@@ -454,6 +509,8 @@ export class World {
       worldTime: this.worldTime,
       timeOfDay: this.timeOfDay,
       skyBrightness: this.getSkyBrightness(),
+      pendingFluidUpdates: this.fluidSimulator?.getPendingCount() ?? 0,
+      streaming,
     };
   }
 

@@ -19,6 +19,21 @@ export const ENGINE_EVENTS = Object.freeze({
   CHUNK_UNLOADED: 'chunk:unloaded',
   ENGINE_TICK: 'engine:tick',
   ENGINE_FRAME: 'engine:frame',
+  INVENTORY_CHANGED: 'inventory:changed',
+  ITEM_CRAFTED: 'inventory:crafted',
+  ITEM_PICKED_UP: 'inventory:picked_up',
+  GAME_MODE_CHANGED: 'world:game_mode_changed',
+  PLAYER_DAMAGED: 'survival:player_damaged',
+  PLAYER_DIED: 'survival:player_died',
+  PLAYER_RESPAWNED: 'survival:player_respawned',
+  SURVIVAL_UPDATED: 'survival:updated',
+  ENTITY_SPAWNED: 'entity:spawned',
+  ENTITY_KILLED: 'entity:killed',
+  MP_CONNECTED: 'mp:connected',
+  MP_DISCONNECTED: 'mp:disconnected',
+  MP_PLAYER_JOINED: 'mp:player_joined',
+  MP_PLAYER_LEFT: 'mp:player_left',
+  MP_CHAT: 'mp:chat',
 });
 
 /**

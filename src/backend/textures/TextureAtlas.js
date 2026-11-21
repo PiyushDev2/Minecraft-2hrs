@@ -37,6 +37,12 @@ const TILE_KEYS = [
   'spruce_log_top',
   'spruce_log_side',
   'spruce_leaves',
+  'planks_oak',
+  'cobblestone',
+  'crafting_table_top',
+  'crafting_table_side',
+  'glass',
+  'bricks',
 ];
 
 /**
@@ -343,6 +349,69 @@ export class TextureAtlas {
             } else {
               const d = (n - 0.5) * 22 + (n2 - 0.5) * 14;
               putPixel(x, y, 42 + d * 0.6, 88 + d, 56 + d * 0.7, 255);
+            }
+            break;
+          }
+          case 'planks_oak': {
+            const seam = y % 4 === 0 || (x === 8 && (y >> 2) % 2 === 0) || (x === 0 && (y >> 2) % 2 === 1);
+            const grain = Math.sin(x * 0.8 + (y >> 2) * 2.1) * 7;
+            const d = (n - 0.5) * 14 + grain + (seam ? -28 : 0);
+            putPixel(x, y, 178 + d, 138 + d * 0.85, 86 + d * 0.65);
+            break;
+          }
+          case 'cobblestone': {
+            const grid = ((x + (y >> 2) * 3) % 5 === 0) || (y % 4 === 0);
+            const c = (grid ? 82 : 122) + (n - 0.5) * 24 + (n2 - 0.5) * 18;
+            putPixel(x, y, c, c, c + 2);
+            break;
+          }
+          case 'crafting_table_top': {
+            const border = x < 2 || x > 13 || y < 2 || y > 13;
+            const grid = !border && ((x - 2) % 4 === 0 || (y - 2) % 4 === 0);
+            if (border) {
+              const d = (n - 0.5) * 14;
+              putPixel(x, y, 118 + d, 78 + d * 0.8, 44 + d * 0.6);
+            } else if (grid) {
+              putPixel(x, y, 76, 50, 28);
+            } else {
+              const d = (n - 0.5) * 12;
+              putPixel(x, y, 184 + d, 142 + d * 0.85, 90 + d * 0.65);
+            }
+            break;
+          }
+          case 'crafting_table_side': {
+            if (y < 4) {
+              const d = (n - 0.5) * 14;
+              putPixel(x, y, 118 + d, 78 + d * 0.8, 44 + d * 0.6);
+            } else if ((x >= 4 && x <= 5 && y >= 6 && y <= 11) || (x >= 10 && x <= 11 && y >= 6 && y <= 11)) {
+              putPixel(x, y, 82, 86, 94);
+            } else {
+              const seam = y % 4 === 0;
+              const d = (n - 0.5) * 14 + (seam ? -22 : 0);
+              putPixel(x, y, 168 + d, 128 + d * 0.85, 78 + d * 0.65);
+            }
+            break;
+          }
+          case 'glass': {
+            const border = x === 0 || x === 15 || y === 0 || y === 15;
+            const glint = (x + y === 6 || x + y === 7 || x + y === 22) && x > 2 && x < 13;
+            if (border) {
+              putPixel(x, y, 182, 224, 240, 255);
+            } else if (glint) {
+              putPixel(x, y, 238, 250, 255, 210);
+            } else {
+              putPixel(x, y, 0, 0, 0, 0);
+            }
+            break;
+          }
+          case 'bricks': {
+            const mortar = y % 4 === 0 || ((x + (y >> 2) * 4) % 8 === 0);
+            if (mortar) {
+              const c = 198 + (n - 0.5) * 16;
+              putPixel(x, y, c, c - 4, c - 10);
+            } else {
+              const d = (n - 0.5) * 24 + (n2 - 0.5) * 16;
+              putPixel(x, y, 162 + d, 76 + d * 0.6, 58 + d * 0.5);
             }
             break;
           }

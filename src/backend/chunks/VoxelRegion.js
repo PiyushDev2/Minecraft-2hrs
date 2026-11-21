@@ -5,7 +5,7 @@
  */
 
 import { BLOCK_IDS } from '../blocks/BlockRegistry.js';
-import { CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH } from './Chunk.js';
+import { CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH } from './ChunkConstants.js';
 
 export const REGION_WIDTH = CHUNK_WIDTH + 2; // 18 (-1..16)
 export const REGION_DEPTH = CHUNK_DEPTH + 2; // 18 (-1..16)
@@ -24,14 +24,16 @@ export class VoxelRegion {
    * @param {number} params.chunkZ
    * @param {Uint8Array} params.blocks
    * @param {Uint8Array} params.lightData
+   * @param {Uint8Array} [params.fluidData]
    * @param {number} params.centerEditVersion
    * @param {string} params.versionSignature
    */
-  constructor({ chunkX, chunkZ, blocks, lightData, centerEditVersion, versionSignature }) {
+  constructor({ chunkX, chunkZ, blocks, lightData, fluidData, centerEditVersion, versionSignature }) {
     this.chunkX = chunkX;
     this.chunkZ = chunkZ;
     this.blocks = blocks;
     this.lightData = lightData;
+    this.fluidData = fluidData ?? new Uint8Array(REGION_VOLUME);
     this.centerEditVersion = centerEditVersion;
     this.versionSignature = versionSignature;
   }
@@ -66,6 +68,19 @@ export class VoxelRegion {
   }
 
   /**
+   * Reads fluid metadata byte at chunk-local coordinates.
+   * @param {number} lx
+   * @param {number} y
+   * @param {number} lz
+   * @returns {number}
+   */
+  getFluidLevel(lx, y, lz) {
+    if (y < 0 || y >= REGION_HEIGHT) return 0;
+    if (lx < -1 || lx > CHUNK_WIDTH || lz < -1 || lz > CHUNK_DEPTH) return 0;
+    return this.fluidData[y * REGION_STRIDE_Y + (lz + 1) * REGION_STRIDE_Z + (lx + 1)];
+  }
+
+  /**
    * Captures a standalone padded 18x128x18 neighborhood snapshot from ChunkManager.
    * @param {import('./ChunkManager.js').ChunkManager} chunkManager
    * @param {number} chunkX
@@ -78,6 +93,7 @@ export class VoxelRegion {
 
     const blocks = new Uint8Array(REGION_VOLUME);
     const lightData = new Uint8Array(REGION_VOLUME);
+    const fluidData = new Uint8Array(REGION_VOLUME);
     // Default unloaded perimeter voxels to open sky light (15)
     lightData.fill(0xf0);
 
@@ -90,6 +106,7 @@ export class VoxelRegion {
         const dstRow = dstYBase + (lz + 1) * REGION_STRIDE_Z + 1;
         blocks.set(center.blocks.subarray(srcRow, srcRow + CHUNK_WIDTH), dstRow);
         lightData.set(center.lightData.subarray(srcRow, srcRow + CHUNK_WIDTH), dstRow);
+        fluidData.set(center.fluidData.subarray(srcRow, srcRow + CHUNK_WIDTH), dstRow);
       }
     }
 
@@ -113,6 +130,7 @@ export class VoxelRegion {
           const dIdx = dstY + (lz + 1) * REGION_STRIDE_Z; // lx=-1 -> 0
           blocks[dIdx] = west.blocks[sIdx];
           lightData[dIdx] = west.lightData[sIdx];
+          fluidData[dIdx] = west.fluidData[sIdx];
         }
       }
 
@@ -122,6 +140,7 @@ export class VoxelRegion {
           const dIdx = dstY + (lz + 1) * REGION_STRIDE_Z + 17; // lx=16 -> 17
           blocks[dIdx] = east.blocks[sIdx];
           lightData[dIdx] = east.lightData[sIdx];
+          fluidData[dIdx] = east.fluidData[sIdx];
         }
       }
 
@@ -130,6 +149,7 @@ export class VoxelRegion {
         const dRow = dstY + 1; // lz=-1 -> 0, lx=0..15 -> 1..16
         blocks.set(north.blocks.subarray(sRow, sRow + CHUNK_WIDTH), dRow);
         lightData.set(north.lightData.subarray(sRow, sRow + CHUNK_WIDTH), dRow);
+        fluidData.set(north.fluidData.subarray(sRow, sRow + CHUNK_WIDTH), dRow);
       }
 
       if (south && south.generated) {
@@ -137,6 +157,7 @@ export class VoxelRegion {
         const dRow = dstY + 17 * REGION_STRIDE_Z + 1; // lz=16 -> 17
         blocks.set(south.blocks.subarray(sRow, sRow + CHUNK_WIDTH), dRow);
         lightData.set(south.lightData.subarray(sRow, sRow + CHUNK_WIDTH), dRow);
+        fluidData.set(south.fluidData.subarray(sRow, sRow + CHUNK_WIDTH), dRow);
       }
 
       // 4 corners for accurate corner Ambient Occlusion across chunk seams
@@ -145,24 +166,28 @@ export class VoxelRegion {
         const dIdx = dstY;
         blocks[dIdx] = nw.blocks[sIdx];
         lightData[dIdx] = nw.lightData[sIdx];
+        fluidData[dIdx] = nw.fluidData[sIdx];
       }
       if (ne && ne.generated) {
         const sIdx = srcY | (15 << 4) | 0;
         const dIdx = dstY + 17;
         blocks[dIdx] = ne.blocks[sIdx];
         lightData[dIdx] = ne.lightData[sIdx];
+        fluidData[dIdx] = ne.fluidData[sIdx];
       }
       if (sw && sw.generated) {
         const sIdx = srcY | (0 << 4) | 15;
         const dIdx = dstY + 17 * REGION_STRIDE_Z;
         blocks[dIdx] = sw.blocks[sIdx];
         lightData[dIdx] = sw.lightData[sIdx];
+        fluidData[dIdx] = sw.fluidData[sIdx];
       }
       if (se && se.generated) {
         const sIdx = srcY | (0 << 4) | 0;
         const dIdx = dstY + 17 * REGION_STRIDE_Z + 17;
         blocks[dIdx] = se.blocks[sIdx];
         lightData[dIdx] = se.lightData[sIdx];
+        fluidData[dIdx] = se.fluidData[sIdx];
       }
     }
 
@@ -183,6 +208,7 @@ export class VoxelRegion {
       chunkZ,
       blocks,
       lightData,
+      fluidData,
       centerEditVersion: center.editVersion,
       versionSignature,
     });

@@ -4,6 +4,8 @@
  * Supports browser localStorage slots as well as portable JSON export/import.
  */
 
+import { IndexedDBSave } from './IndexedDBSave.js';
+
 const SAVE_PREFIX = 'voxelcraft_save_v1_';
 const SAVE_FORMAT_VERSION = 1;
 
@@ -12,13 +14,14 @@ const SAVE_FORMAT_VERSION = 1;
  */
 export class WorldSave {
   /**
-   * Serializes world seed, player state, world time, and modified block deltas into a plain object.
+   * Serializes world seed, player state, world time, inventory, and modified block deltas into a plain object.
    * @param {import('../world/World.js').World} world
    * @param {import('../physics/Player.js').Player} [player]
    * @param {string} [name='default']
-   * @returns {{ version: number, name: string, savedAt: string, seed: number, worldTime: number, viewDistance: number, totalModifiedBlocks: number, player: any, modifications: Record<string, Array<[number, number]>> }}
+   * @param {{ gameMode?: string, inventory?: any, survival?: any }} [extra]
+   * @returns {{ version: number, name: string, savedAt: string, seed: number, worldTime: number, timeOfDay: number, viewDistance: number, totalModifiedBlocks: number, gameMode?: string, inventory?: any, survival?: any, player: any, modifications: Record<string, Array<[number, number] | [number, number, number]>> }}
    */
-  static serialize(world, player = null, name = 'default') {
+  static serialize(world, player = null, name = 'default', extra = undefined) {
     const modifications = world.chunkManager.exportAllModifications();
     let totalModifiedBlocks = 0;
     for (const list of Object.values(modifications)) {
@@ -34,6 +37,9 @@ export class WorldSave {
       timeOfDay: world.timeOfDay,
       viewDistance: world.viewDistance,
       totalModifiedBlocks,
+      ...(extra?.gameMode ? { gameMode: extra.gameMode } : {}),
+      ...(extra?.inventory ? { inventory: extra.inventory } : {}),
+      ...(extra?.survival ? { survival: extra.survival } : {}),
       player: player
         ? {
             position: player.getPosition(),
@@ -50,16 +56,17 @@ export class WorldSave {
    * @param {import('../world/World.js').World} world
    * @param {import('../physics/Player.js').Player} [player]
    * @param {string} [name='default']
+   * @param {{ gameMode?: string, inventory?: any, survival?: any }} [extra]
    * @returns {string}
    */
-  static exportJSON(world, player = null, name = 'default') {
-    return JSON.stringify(WorldSave.serialize(world, player, name));
+  static exportJSON(world, player = null, name = 'default', extra = undefined) {
+    return JSON.stringify(WorldSave.serialize(world, player, name, extra));
   }
 
   /**
    * Parses and validates a JSON save string.
    * @param {string} jsonString
-   * @returns {{ version: number, name: string, savedAt: string, seed: number, worldTime: number, viewDistance: number, totalModifiedBlocks: number, player: any, modifications: Record<string, Array<[number, number]>> }}
+   * @returns {{ version: number, name: string, savedAt: string, seed: number, worldTime: number, timeOfDay: number, viewDistance: number, totalModifiedBlocks: number, player: any, modifications: Record<string, Array<[number, number] | [number, number, number]>> }}
    */
   static parseJSON(jsonString) {
     const data = JSON.parse(jsonString);
@@ -112,13 +119,14 @@ export class WorldSave {
    * @param {import('../world/World.js').World} world
    * @param {import('../physics/Player.js').Player|null} player
    * @param {string} [slotName='default']
-   * @returns {{ version: number, name: string, savedAt: string, seed: number, worldTime: number, viewDistance: number, totalModifiedBlocks: number, player: any, modifications: Record<string, Array<[number, number]>> }} The serialized save metadata.
+   * @param {{ gameMode?: string, inventory?: any, survival?: any }} [extra]
+   * @returns {{ version: number, name: string, savedAt: string, seed: number, worldTime: number, timeOfDay: number, viewDistance: number, totalModifiedBlocks: number, gameMode?: string, inventory?: any, survival?: any, player: any, modifications: Record<string, Array<[number, number] | [number, number, number]>> }} The serialized save metadata.
    */
-  static saveToStorage(world, player = null, slotName = 'default') {
+  static saveToStorage(world, player = null, slotName = 'default', extra = undefined) {
     if (typeof localStorage === 'undefined') {
       throw new Error('localStorage is not available in this environment.');
     }
-    const payload = WorldSave.serialize(world, player, slotName);
+    const payload = WorldSave.serialize(world, player, slotName, extra);
     localStorage.setItem(`${SAVE_PREFIX}${slotName}`, JSON.stringify(payload));
     return payload;
   }
@@ -168,5 +176,52 @@ export class WorldSave {
   static deleteSave(slotName) {
     if (typeof localStorage === 'undefined') return;
     localStorage.removeItem(`${SAVE_PREFIX}${slotName}`);
+  }
+
+  /**
+   * Asynchronously saves world, player, inventory, and survival vitals to IndexedDB.
+   * @param {import('../world/World.js').World} world
+   * @param {import('../physics/Player.js').Player|null} player
+   * @param {string} [slotName='default']
+   * @param {{ gameMode?: string, inventory?: any, survival?: any }} [extra]
+   */
+  static async saveAsync(world, player = null, slotName = 'default', extra = undefined) {
+    const payload = WorldSave.serialize(world, player, slotName, extra);
+    return IndexedDBSave.put(slotName, payload);
+  }
+
+  /**
+   * Asynchronously loads a saved slot from IndexedDB (falling back to localStorage if present).
+   * @param {string} [slotName='default']
+   * @returns {Promise<any|null>}
+   */
+  static async loadAsync(slotName = 'default') {
+    const idbData = await IndexedDBSave.get(slotName);
+    if (idbData) return idbData;
+    return WorldSave.loadFromStorage(slotName);
+  }
+
+  /**
+   * Lists saved world slots across IndexedDB (plus any legacy localStorage-only slots).
+   * @returns {Promise<Array<{ slotName: string, seed: number, savedAt: string, totalModifiedBlocks: number, gameMode?: string, byteSize?: number }>>}
+   */
+  static async listSavesAsync() {
+    const idbList = await IndexedDBSave.list();
+    const seen = new Set(idbList.map((s) => s.slotName));
+    for (const legacy of WorldSave.listSaves()) {
+      if (!seen.has(legacy.slotName)) {
+        idbList.push(legacy);
+      }
+    }
+    return idbList.sort((a, b) => String(b.savedAt).localeCompare(String(a.savedAt)));
+  }
+
+  /**
+   * Deletes a saved slot from both IndexedDB and localStorage.
+   * @param {string} slotName
+   */
+  static async deleteSaveAsync(slotName) {
+    await IndexedDBSave.delete(slotName);
+    WorldSave.deleteSave(slotName);
   }
 }

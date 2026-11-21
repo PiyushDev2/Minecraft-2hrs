@@ -7,21 +7,15 @@
 
 import * as THREE from 'three';
 import { BLOCK_IDS } from '../blocks/BlockRegistry.js';
+import {
+  CHUNK_DEPTH,
+  CHUNK_HEIGHT,
+  CHUNK_VOLUME,
+  CHUNK_WIDTH,
+  getChunkKey,
+} from './ChunkConstants.js';
 
-export const CHUNK_WIDTH = 16;
-export const CHUNK_DEPTH = 16;
-export const CHUNK_HEIGHT = 128;
-export const CHUNK_VOLUME = CHUNK_WIDTH * CHUNK_HEIGHT * CHUNK_DEPTH;
-
-/**
- * Generates a canonical map key for chunk coordinates.
- * @param {number} chunkX
- * @param {number} chunkZ
- * @returns {string}
- */
-export function getChunkKey(chunkX, chunkZ) {
-  return `${chunkX},${chunkZ}`;
-}
+export { CHUNK_WIDTH, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_VOLUME, getChunkKey };
 
 /**
  * A single 16x128x16 chunk of voxel data and its associated Three.js mesh group.
@@ -56,6 +50,13 @@ export class Chunk {
      * @type {Uint8Array}
      */
     this.lightData = new Uint8Array(CHUNK_VOLUME);
+
+    /**
+     * Per-voxel fluid metadata for WATER blocks:
+     * 0 = source (full), 1..7 = horizontal flow distance, bit 0x10 = falling column.
+     * @type {Uint8Array}
+     */
+    this.fluidData = new Uint8Array(CHUNK_VOLUME);
 
     /**
      * Sparse map of local voxel index -> blockId for player edits (for compact saving).
@@ -167,6 +168,9 @@ export class Chunk {
       return false;
     }
     this.blocks[idx] = blockId;
+    if (blockId !== BLOCK_IDS.WATER) {
+      this.fluidData[idx] = 0;
+    }
     if (recordModification) {
       this.modifications.set(idx, blockId);
     }
@@ -176,6 +180,37 @@ export class Chunk {
       this.editVersion++;
     }
     return prev !== blockId;
+  }
+
+  /**
+   * Gets fluid metadata byte at local chunk coordinates (0 = source, 1..7 = flow dist, 0x10 = falling).
+   * @param {number} lx
+   * @param {number} y
+   * @param {number} lz
+   * @returns {number}
+   */
+  getFluidLevel(lx, y, lz) {
+    if (!this.isInBounds(lx, y, lz)) return 0;
+    return this.fluidData[(y << 8) | (lz << 4) | lx];
+  }
+
+  /**
+   * Sets fluid metadata byte at local chunk coordinates and marks chunk dirty/versioned if changed.
+   * @param {number} lx
+   * @param {number} y
+   * @param {number} lz
+   * @param {number} meta
+   * @returns {boolean}
+   */
+  setFluidLevel(lx, y, lz, meta) {
+    if (!this.isInBounds(lx, y, lz)) return false;
+    const idx = (y << 8) | (lz << 4) | lx;
+    const next = meta & 0xff;
+    if (this.fluidData[idx] === next) return false;
+    this.fluidData[idx] = next;
+    this.dirty = true;
+    this.editVersion++;
+    return true;
   }
 
   /**
@@ -243,14 +278,16 @@ export class Chunk {
 
   /**
    * Applies saved player modification entries after procedural generation.
-   * @param {Array<[number, number]>} entries
+   * Accepts both v1 [idx, blockId] and fluid-aware [idx, blockId, fluidMeta] tuples.
+   * @param {Array<[number, number] | [number, number, number]>} entries
    */
   applyModifications(entries) {
     if (!Array.isArray(entries)) return;
     for (let i = 0; i < entries.length; i++) {
-      const [idx, blockId] = entries[i];
+      const [idx, blockId, fluidMeta = 0] = entries[i];
       if (idx >= 0 && idx < CHUNK_VOLUME) {
         this.blocks[idx] = blockId;
+        this.fluidData[idx] = blockId === BLOCK_IDS.WATER ? fluidMeta & 0xff : 0;
         this.modifications.set(idx, blockId);
       }
     }
@@ -263,10 +300,15 @@ export class Chunk {
 
   /**
    * Exports sparse modification tuples for saving.
-   * @returns {Array<[number, number]>}
+   * @returns {Array<[number, number] | [number, number, number]>}
    */
   exportModifications() {
-    return Array.from(this.modifications.entries());
+    const out = [];
+    for (const [idx, blockId] of this.modifications.entries()) {
+      const fMeta = blockId === BLOCK_IDS.WATER ? this.fluidData[idx] : 0;
+      out.push(fMeta !== 0 ? [idx, blockId, fMeta] : [idx, blockId]);
+    }
+    return out;
   }
 
   /**

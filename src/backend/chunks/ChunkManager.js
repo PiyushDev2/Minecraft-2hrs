@@ -5,6 +5,7 @@
  */
 
 import { BLOCK_IDS, blockRegistry as defaultBlockRegistry } from '../blocks/BlockRegistry.js';
+import { FluidSimulator } from '../fluid/FluidSimulator.js';
 import { LightEngine } from '../lighting/LightEngine.js';
 import { Chunk, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH, getChunkKey } from './Chunk.js';
 import { MeshWorkerPool } from './MeshWorkerPool.js';
@@ -20,28 +21,32 @@ export class ChunkManager {
    * @param {import('./ChunkMesher.js').ChunkMesher} options.chunkMesher
    * @param {import('../blocks/BlockRegistry.js').BlockRegistry} [options.blockRegistry]
    * @param {LightEngine|null} [options.lightEngine]
+   * @param {FluidSimulator|null} [options.fluidSimulator]
    * @param {MeshWorkerPool|null} [options.workerPool]
    * @param {boolean} [options.useWorkers=true]
    * @param {number} [options.viewDistance=5] - Radius in chunks around center.
-   * @param {number} [options.maxChunksGeneratedPerFrame=2]
-   * @param {number} [options.maxChunksMeshedPerFrame=3]
+   * @param {number} [options.maxChunksGeneratedPerFrame=4]
+   * @param {number} [options.maxChunksMeshedPerFrame=6]
    */
   constructor({
     terrainGenerator,
     chunkMesher,
     blockRegistry = chunkMesher?.blockRegistry ?? defaultBlockRegistry,
     lightEngine = undefined,
+    fluidSimulator = undefined,
     workerPool = undefined,
     useWorkers = true,
     viewDistance = 5,
-    maxChunksGeneratedPerFrame = 2,
-    maxChunksMeshedPerFrame = 3,
+    maxChunksGeneratedPerFrame = 4,
+    maxChunksMeshedPerFrame = 6,
   }) {
     this.terrainGenerator = terrainGenerator;
     this.chunkMesher = chunkMesher;
     this.blockRegistry = blockRegistry;
     this.lightEngine =
       lightEngine === undefined ? new LightEngine(this, this.blockRegistry) : lightEngine;
+    this.fluidSimulator =
+      fluidSimulator === undefined ? new FluidSimulator(this, this.blockRegistry) : fluidSimulator;
     this.meshWorkerPool =
       workerPool !== undefined
         ? workerPool
@@ -62,7 +67,7 @@ export class ChunkManager {
     /**
      * Pending saved chunk modification deltas keyed by "chunkX,chunkZ".
      * Applied automatically whenever that chunk loads.
-     * @type {Map<string, Array<[number, number]>>}
+     * @type {Map<string, Array<[number, number] | [number, number, number]>>}
      */
     this.pendingModifications = new Map();
 
@@ -155,6 +160,15 @@ export class ChunkManager {
     if (savedMods) {
       chunk.applyModifications(savedMods);
       this.pendingModifications.delete(key);
+      if (this.fluidSimulator) {
+        for (let i = 0; i < savedMods.length; i++) {
+          const [idx, blockId] = savedMods[i];
+          if (blockId === BLOCK_IDS.WATER) {
+            const { lx, y, lz } = Chunk.decodeIndex(idx);
+            this.fluidSimulator.scheduleNeighbors(chunk.worldX + lx, y, chunk.worldZ + lz);
+          }
+        }
+      }
     }
 
     this.chunks.set(key, chunk);
@@ -251,15 +265,60 @@ export class ChunkManager {
   }
 
   /**
+   * Gets fluid metadata byte at world coordinates (wx, wy, wz).
+   * @param {number} wx
+   * @param {number} wy
+   * @param {number} wz
+   * @returns {number}
+   */
+  getFluidLevel(wx, wy, wz) {
+    const iy = Math.floor(wy);
+    if (iy < 0 || iy >= CHUNK_HEIGHT) return 0;
+    const { chunkX, chunkZ, lx, lz } = this.worldToChunkCoord(wx, wz);
+    const chunk = this.getChunk(chunkX, chunkZ);
+    if (!chunk) return 0;
+    return chunk.getFluidLevel(lx, iy, lz);
+  }
+
+  /**
+   * Sets fluid metadata byte at world coordinates (wx, wy, wz) and dirties border chunks.
+   * @param {number} wx
+   * @param {number} wy
+   * @param {number} wz
+   * @param {number} meta
+   * @returns {boolean}
+   */
+  setFluidLevel(wx, wy, wz, meta) {
+    const ix = Math.floor(wx);
+    const iy = Math.floor(wy);
+    const iz = Math.floor(wz);
+    if (iy < 0 || iy >= CHUNK_HEIGHT) return false;
+    const { chunkX, chunkZ, lx, lz } = this.worldToChunkCoord(ix, iz);
+    const chunk = this.getChunk(chunkX, chunkZ);
+    if (!chunk) return false;
+
+    const changed = chunk.setFluidLevel(lx, iy, lz, meta);
+    if (!changed) return false;
+    this._inFlightSignatures.delete(chunk.key);
+
+    if (lx === 0) this._dirtyIfLoaded(chunkX - 1, chunkZ);
+    if (lx === CHUNK_WIDTH - 1) this._dirtyIfLoaded(chunkX + 1, chunkZ);
+    if (lz === 0) this._dirtyIfLoaded(chunkX, chunkZ - 1);
+    if (lz === CHUNK_DEPTH - 1) this._dirtyIfLoaded(chunkX, chunkZ + 1);
+    return true;
+  }
+
+  /**
    * Sets block ID at world coordinates (wx, wy, wz) and marks affected chunk(s) dirty.
    * @param {number} wx
    * @param {number} wy
    * @param {number} wz
    * @param {number} blockId
    * @param {boolean} [recordModification=true]
+   * @param {number} [fluidMeta]
    * @returns {boolean}
    */
-  setBlock(wx, wy, wz, blockId, recordModification = true) {
+  setBlock(wx, wy, wz, blockId, recordModification = true, fluidMeta = undefined) {
     const ix = Math.floor(wx);
     const iy = Math.floor(wy);
     const iz = Math.floor(wz);
@@ -274,9 +333,17 @@ export class ChunkManager {
 
     const prevId = chunk.getBlock(lx, iy, lz);
     const changed = chunk.setBlock(lx, iy, lz, blockId, recordModification);
-    if (!changed) return false;
+    const fluidChanged =
+      fluidMeta !== undefined && blockId === BLOCK_IDS.WATER
+        ? chunk.setFluidLevel(lx, iy, lz, fluidMeta)
+        : false;
+    if (!changed && !fluidChanged) return false;
+    this._inFlightSignatures.delete(chunk.key);
 
-    this.lightEngine?.onBlockChanged(ix, iy, iz, prevId, blockId);
+    if (changed) {
+      this.lightEngine?.onBlockChanged(ix, iy, iz, prevId, blockId);
+      this.fluidSimulator?.onBlockChanged(ix, iy, iz, prevId, blockId);
+    }
 
     // If on chunk border, mark neighboring chunk dirty so adjacent face visibility updates
     if (lx === 0) this._dirtyIfLoaded(chunkX - 1, chunkZ);
@@ -285,6 +352,29 @@ export class ChunkManager {
     if (lz === CHUNK_DEPTH - 1) this._dirtyIfLoaded(chunkX, chunkZ + 1);
 
     return true;
+  }
+
+  /**
+   * Immediately remeshes the chunk containing (wx, wz) plus any dirty cardinal neighbors
+   * so interactive block breaking/placing has zero frame delay or stale seam faces.
+   * @param {number} wx
+   * @param {number} wz
+   */
+  remeshNeighborhoodForBlock(wx, wz) {
+    const { chunkX, chunkZ } = this.worldToChunkCoord(wx, wz);
+    const candidates = [
+      this.getChunk(chunkX, chunkZ),
+      this.getChunk(chunkX - 1, chunkZ),
+      this.getChunk(chunkX + 1, chunkZ),
+      this.getChunk(chunkX, chunkZ - 1),
+      this.getChunk(chunkX, chunkZ + 1),
+    ];
+    for (let i = 0; i < candidates.length; i++) {
+      const c = candidates[i];
+      if (c && c.generated && c.dirty) {
+        this.remeshChunk(c);
+      }
+    }
   }
 
   /**
@@ -299,7 +389,8 @@ export class ChunkManager {
     this.chunkMesher.buildChunkMesh(
       chunk,
       (wx, wy, wz) => this.getBlock(wx, wy, wz),
-      getLight
+      getLight,
+      (wx, wy, wz) => this.getFluidLevel(wx, wy, wz)
     );
     this._inFlightSignatures.delete(chunk.key);
     for (const cb of this._onChunkMeshReady) {
@@ -335,6 +426,11 @@ export class ChunkManager {
 
       const currentChunk = this.getChunk(result.chunkX, result.chunkZ);
       if (!currentChunk || !currentChunk.generated) return;
+
+      if (result.type === 'error') {
+        this.remeshChunk(currentChunk);
+        return;
+      }
 
       const currentSig = VoxelRegion.computeVersionSignature(
         this,
@@ -418,7 +514,11 @@ export class ChunkManager {
 
     if (missing.length > 0) {
       missing.sort((a, b) => a.distSq - b.distSq);
-      const genBudget = Math.min(this.maxChunksGeneratedPerFrame, missing.length);
+      const effectiveGenBudget =
+        missing.length > 16
+          ? Math.max(this.maxChunksGeneratedPerFrame, 8)
+          : this.maxChunksGeneratedPerFrame;
+      const genBudget = Math.min(effectiveGenBudget, missing.length);
       for (let i = 0; i < genBudget; i++) {
         this.loadChunk(missing[i].cx, missing[i].cz, false);
       }
@@ -437,16 +537,52 @@ export class ChunkManager {
     if (dirtyChunks.length > 0) {
       dirtyChunks.sort((a, b) => a.distSq - b.distSq);
       const useAsyncPool = Boolean(this.meshWorkerPool && this.meshWorkerPool.isReady());
-      const meshBudget = Math.min(this.maxChunksMeshedPerFrame, dirtyChunks.length);
+      const effectiveMeshBudget =
+        dirtyChunks.length > 16
+          ? Math.max(this.maxChunksMeshedPerFrame, 10)
+          : this.maxChunksMeshedPerFrame;
+      const meshBudget = Math.min(effectiveMeshBudget, dirtyChunks.length);
       for (let i = 0; i < meshBudget; i++) {
-        const dirtyChunk = dirtyChunks[i].chunk;
-        if (useAsyncPool) {
-          this.remeshChunkAsync(dirtyChunk);
+        const entry = dirtyChunks[i];
+        // Remesh chunks immediately around the player synchronously so edits & fluids never lag visually
+        if (!useAsyncPool || entry.distSq <= 2) {
+          this.remeshChunk(entry.chunk);
         } else {
-          this.remeshChunk(dirtyChunk);
+          this.remeshChunkAsync(entry.chunk);
         }
       }
     }
+  }
+
+  /**
+   * Computes streaming progress around (centerWX, centerWZ) for HUD indicators.
+   * @param {number} centerWX
+   * @param {number} centerWZ
+   * @returns {{ loadedInRadius: number, targetChunks: number, dirtyChunks: number }}
+   */
+  getStreamingProgress(centerWX, centerWZ) {
+    const { chunkX: centerCX, chunkZ: centerCZ } = this.worldToChunkCoord(centerWX, centerWZ);
+    const vd = this.viewDistance;
+    const vdSq = vd * vd + 1;
+    let targetChunks = 0;
+    let loadedInRadius = 0;
+    let dirtyChunks = 0;
+
+    for (let dz = -vd; dz <= vd; dz++) {
+      for (let dx = -vd; dx <= vd; dx++) {
+        if (dx * dx + dz * dz > vdSq) continue;
+        targetChunks++;
+        const chunk = this.getChunk(centerCX + dx, centerCZ + dz);
+        if (chunk && chunk.generated) {
+          loadedInRadius++;
+          if (chunk.dirty || !chunk.meshGroup) {
+            dirtyChunks++;
+          }
+        }
+      }
+    }
+
+    return { loadedInRadius, targetChunks, dirtyChunks };
   }
 
   /**
@@ -480,7 +616,7 @@ export class ChunkManager {
 
   /**
    * Exports all player modifications across both loaded and unloaded chunks.
-   * @returns {Record<string, Array<[number, number]>>}
+   * @returns {Record<string, Array<[number, number] | [number, number, number]>>}
    */
   exportAllModifications() {
     const result = {};
@@ -499,7 +635,7 @@ export class ChunkManager {
 
   /**
    * Loads saved modification deltas into pendingModifications and applies to any loaded chunks.
-   * @param {Record<string, Array<[number, number]>>} modMap
+   * @param {Record<string, Array<[number, number] | [number, number, number]>>} modMap
    */
   importModifications(modMap) {
     this.pendingModifications.clear();
@@ -520,6 +656,7 @@ export class ChunkManager {
    * Unloads and disposes all chunks and invalidates any in-flight worker mesh jobs.
    */
   clear() {
+    this.fluidSimulator?.clear();
     this.meshWorkerPool?.invalidateEpoch();
     this._inFlightSignatures.clear();
     for (const chunk of this.chunks.values()) {

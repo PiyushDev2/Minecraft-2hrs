@@ -373,7 +373,7 @@ export class LightEngine {
       const z = queue[head++];
       const level = queue[head++];
 
-      if (level <= 1) continue;
+      if (level <= 1 || this._getBlockLight(x, y, z) < level) continue;
 
       for (let i = 0; i < 6; i++) {
         const nx = x + NEIGHBORS[i][0];
@@ -440,7 +440,7 @@ export class LightEngine {
       const z = queue[head++];
       const level = queue[head++];
 
-      if (level <= 1) continue;
+      if (level <= 1 || this._getSky(x, y, z) < level) continue;
 
       for (let i = 0; i < 6; i++) {
         const dx = NEIGHBORS[i][0];

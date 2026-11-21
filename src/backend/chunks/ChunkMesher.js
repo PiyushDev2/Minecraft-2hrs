@@ -124,11 +124,14 @@ export class ChunkMesher {
    * @param {import('./Chunk.js').Chunk} chunk
    * @param {(wx: number, wy: number, wz: number) => number} getWorldBlock
    * @param {(wx: number, wy: number, wz: number) => { sky: number, block: number }} [getWorldLight]
+   * @param {(wx: number, wy: number, wz: number) => number} [getWorldFluidLevel]
    * @returns {{ group: THREE.Group, opaqueMesh: THREE.Mesh|null, waterMesh: THREE.Mesh|null, faceCount: number, triangleCount: number }}
    */
-  buildChunkMesh(chunk, getWorldBlock, getWorldLight) {
+  buildChunkMesh(chunk, getWorldBlock, getWorldLight, getWorldFluidLevel) {
     const lightLookup =
       typeof getWorldLight === 'function' ? getWorldLight : () => ({ sky: 15, block: 0 });
+    const fluidLookup =
+      typeof getWorldFluidLevel === 'function' ? getWorldFluidLevel : () => 0;
 
     const getBlockAtLocal = (lx, y, lz) => {
       if (y < 0 || y >= CHUNK_HEIGHT) return BLOCK_IDS.AIR;
@@ -148,9 +151,18 @@ export class ChunkMesher {
       return lightLookup(chunk.worldX + lx, y, chunk.worldZ + lz);
     };
 
+    const getFluidLevelAtLocal = (lx, y, lz) => {
+      if (y < 0 || y >= CHUNK_HEIGHT) return 0;
+      if (lx >= 0 && lx < CHUNK_WIDTH && lz >= 0 && lz < CHUNK_DEPTH) {
+        return chunk.fluidData[(y << 8) | (lz << 4) | lx];
+      }
+      return fluidLookup(chunk.worldX + lx, y, chunk.worldZ + lz);
+    };
+
     const built = buildChunkGeometryBuffers({
       getBlockAtLocal,
       getLightAtLocal,
+      getFluidLevelAtLocal,
       blockTable: this.blockRegistry.exportMesherTable(),
       tileRects: this._tileRects,
     });
