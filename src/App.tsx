@@ -878,6 +878,16 @@ export default function App() {
       wm.bus.on(ENGINE_EVENTS.MP_CHAT, (msg: any) => {
         pushChat(msg.senderName || msg.name || 'Player', msg.text || '', 'chat');
       }),
+      wm.bus.on(ENGINE_EVENTS.MP_CONNECTED, (info: any) => {
+        pushChat('Multiplayer', `Connected to room "${info.roomId}".`, 'system');
+      }),
+      wm.bus.on(ENGINE_EVENTS.MP_CONNECTION_FAILED, (info: any) => {
+        pushChat(
+          'Multiplayer',
+          `Could not join "${info.roomId}" after ${info.attempts} attempt(s) (${info.reason || 'connection closed'}). Check that the multiplayer server is running and its WebSocket URL is configured.`,
+          'error'
+        );
+      }),
       wm.bus.on(ENGINE_EVENTS.INVENTORY_CHANGED, () => {
         setModalRevision((r) => r + 1);
       }),

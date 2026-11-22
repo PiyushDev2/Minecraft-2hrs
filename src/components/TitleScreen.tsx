@@ -401,6 +401,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
           </h2>
           <p className="text-xs text-neutral-300 leading-relaxed">
             Join a live WebSocket room with friends. All block edits, player avatars, and chat sync in real time.
+            Hosted game sites need a running multiplayer server; set VITE_MULTIPLAYER_WS_URL to its wss:// address if it is hosted separately.
           </p>
 
           <label className="flex flex-col gap-1 text-xs text-neutral-300">

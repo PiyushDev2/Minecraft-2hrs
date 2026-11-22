@@ -70,6 +70,61 @@ test('IndexedDBSave & WorldManager support multi-slot async saves, listing, dele
   }
 });
 
+test('Multiplayer client reports when a socket closes before its room join is acknowledged', async () => {
+  const wm = new WorldManager({ seed: 'join-failure-test', viewDistance: 3 });
+
+  class FakeWebSocket {
+    static instance;
+
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.listeners = new Map();
+      FakeWebSocket.instance = this;
+    }
+
+    addEventListener(name, listener) {
+      this.listeners.set(name, listener);
+    }
+
+    send() {}
+
+    close() {
+      this.readyState = 3;
+    }
+
+    dispatch(name, event = {}) {
+      this.listeners.get(name)?.(event);
+    }
+  }
+
+  try {
+    wm.network._maxReconnectAttempts = 0;
+    const failurePromise = waitForEvent(wm.bus, ENGINE_EVENTS.MP_CONNECTION_FAILED);
+    wm.network.connect({
+      roomId: 'Friends Room',
+      playerName: 'Alice',
+      url: 'wss://multiplayer.example.test/ws',
+      WebSocketImpl: FakeWebSocket,
+    });
+
+    const socket = FakeWebSocket.instance;
+    socket.readyState = 1;
+    socket.dispatch('open');
+    assert.equal(wm.network.status, 'connecting', 'socket open alone must not count as joining');
+
+    socket.readyState = 3;
+    socket.dispatch('close', { code: 1006, reason: 'No multiplayer service' });
+    const failure = await failurePromise;
+    assert.equal(failure.roomId, 'friends-room');
+    assert.equal(failure.reason, 'No multiplayer service');
+    assert.equal(failure.attempts, 1);
+    assert.equal(wm.network.status, 'disconnected');
+  } finally {
+    wm.dispose();
+  }
+});
+
 test('Authoritative WebSocket server synchronizes rooms, player movement, block edits, time, and chat across clients', async () => {
   const server = http.createServer();
   const { wss } = attachMultiplayerServer(server);
