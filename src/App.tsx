@@ -39,6 +39,8 @@ import { FirstPersonHand } from './game/FirstPersonHand';
 import { ParticleSystem } from './game/ParticleSystem';
 import { PlayerAvatar } from './game/PlayerAvatar.js';
 import { resourcePackManager, type StoredResourcePack } from './game/ResourcePackManager';
+import { MultiplayerClient } from './backend/network/MultiplayerClient.js';
+import { normalizeRoomId, normalizeWebSocketUrl } from './backend/network/MultiplayerProtocol.js';
 import { SkyAndWeather } from './game/SkyAndWeather';
 import { SoundEngine } from './game/SoundEngine';
 import { XpOrbManager } from './game/XpOrbManager';
@@ -2064,25 +2066,43 @@ export default function App() {
     [buildHudSnapshot, pushChat, refreshSavedWorlds]
   );
 
+  const handleTestMultiplayerServer = useCallback(async (serverAddress: string) => {
+    try {
+      const serverUrl = normalizeWebSocketUrl(serverAddress, window.location.href);
+      return await MultiplayerClient.testServerConnection(serverUrl);
+    } catch (error) {
+      return {
+        ok: false,
+        message: error instanceof Error ? error.message : 'Could not validate the multiplayer server address.',
+      };
+    }
+  }, []);
+
   const handleJoinMultiplayer = useCallback(
-    (roomId: string, playerName: string) => {
+    (roomId: string, playerName: string, serverAddress: string) => {
       const wm = worldManagerRef.current;
       if (!wm) return;
+      let wsUrl: string;
+      try {
+        wsUrl = normalizeWebSocketUrl(serverAddress, window.location.href);
+      } catch (error) {
+        pushChat('Multiplayer', error instanceof Error ? error.message : 'Invalid server address.', 'error');
+        return;
+      }
+      const normalizedRoomId = normalizeRoomId(roomId);
       soundRef.current?.unlock();
       xpOrbsRef.current?.clear();
       portalProgressRef.current = 0;
-      const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${proto}//${window.location.host}/ws`;
       wm.setGameMode('survival');
       wm.inventory.loadStarterKit();
       wm.initWorld(1337, { x: 8, z: 8 });
       skyRef.current?.setDimension('overworld');
-      wm.network.connect({ url: wsUrl, roomId, playerName });
-      setCurrentSlotName(`MP:${roomId}`);
+      wm.network.connect({ url: wsUrl, roomId: normalizedRoomId, playerName });
+      setCurrentSlotName(`MP:${normalizedRoomId}`);
       setModal(null);
       setScreen('playing');
       setHud(buildHudSnapshot(wm));
-      pushChat('Multiplayer', `Joining room "${roomId}" as ${playerName}...`, 'system');
+      pushChat('Multiplayer', `Joining room "${normalizedRoomId}" as ${playerName}...`, 'system');
     },
     [buildHudSnapshot, pushChat]
   );
@@ -2193,6 +2213,7 @@ export default function App() {
           onDeleteWorld={handleDeleteWorld}
           onImportWorldJson={handleImportWorldJson}
           onJoinMultiplayer={handleJoinMultiplayer}
+          onTestMultiplayerServer={handleTestMultiplayerServer}
           onUiClick={playUiClick}
         />
       )}

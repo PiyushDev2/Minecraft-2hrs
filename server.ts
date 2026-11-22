@@ -59,6 +59,14 @@ export interface VoxelServerHandle {
   close: () => Promise<void>;
 }
 
+const MAX_ROOM_PLAYERS = 16;
+const MAX_ROOM_BLOCKS = 20_000;
+const WORLD_BORDER = 30_000_000;
+
+function isWithinWorldBorder(value: unknown): value is number {
+  return Number.isFinite(value) && Math.abs(value as number) <= WORLD_BORDER;
+}
+
 /**
  * Attaches the authoritative WebSocket multiplayer handler to an existing HTTP server.
  */
@@ -66,7 +74,7 @@ export function attachMultiplayerServer(server: http.Server): {
   wss: WebSocketServer;
   rooms: Map<string, RoomState>;
 } {
-  const wss = new WebSocketServer({ server, path: '/ws' });
+  const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 16 * 1024 });
   const rooms = new Map<string, RoomState>();
   let nextClientSeq = 1;
 
@@ -97,6 +105,32 @@ export function attachMultiplayerServer(server: http.Server): {
   wss.on('connection', (socket) => {
     const clientId = `p-${nextClientSeq++}`;
     let activeRoom: RoomState | null = null;
+    const messageBuckets = new Map<string, { startedAt: number; count: number }>();
+    const messageLimits: Record<string, [number, number]> = {
+      [MP_MESSAGES.JOIN_ROOM]: [3, 10_000],
+      [MP_MESSAGES.PLAYER_MOVE]: [30, 1_000],
+      [MP_MESSAGES.BLOCK_SET]: [40, 1_000],
+      [MP_MESSAGES.TIME_SET]: [2, 1_000],
+      [MP_MESSAGES.CHAT]: [4, 5_000],
+    };
+
+    const allowRate = (key: string, limit: number, intervalMs: number) => {
+      const now = Date.now();
+      const bucket = messageBuckets.get(key);
+      if (!bucket || now - bucket.startedAt >= intervalMs) {
+        messageBuckets.set(key, { startedAt: now, count: 1 });
+        return true;
+      }
+      if (bucket.count >= limit) return false;
+      bucket.count += 1;
+      return true;
+    };
+
+    const rejectJoin = (code: string, message: string) => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      socket.send(encodePacket(MP_MESSAGES.ERROR, { code, message }));
+      socket.close(4003, code);
+    };
 
     const leaveCurrentRoom = () => {
       if (!activeRoom) return;
@@ -116,6 +150,9 @@ export function attachMultiplayerServer(server: http.Server): {
       const msg = decodePacket(rawData.toString());
       if (!msg) return;
 
+      const limit = messageLimits[msg.type];
+      if (limit && !allowRate(msg.type, limit[0], limit[1])) return;
+
       switch (msg.type) {
         case MP_MESSAGES.PING: {
           socket.send(encodePacket(MP_MESSAGES.PONG, { ts: msg.ts ?? Date.now() }));
@@ -123,42 +160,79 @@ export function attachMultiplayerServer(server: http.Server): {
         }
 
         case MP_MESSAGES.JOIN_ROOM: {
-          leaveCurrentRoom();
-          const roomId = normalizeRoomId(msg.roomId);
-          const seed = msg.seed ?? 'alpine-valley-2026';
-          const room = getOrCreateRoom(roomId, seed);
-          activeRoom = room;
+          if (typeof msg.roomId !== 'string' || typeof msg.playerName !== 'string') {
+            rejectJoin('INVALID_JOIN', 'Enter a room ID and player name to join.');
+            return;
+          }
+          const rawRoomId = msg.roomId.trim();
+          const rawPlayerName = msg.playerName.trim();
+          if (!rawRoomId || rawRoomId.length > 32 || !/^[a-zA-Z0-9 _-]+$/.test(rawRoomId)) {
+            rejectJoin('INVALID_ROOM', 'Room IDs must be 1–32 letters, numbers, spaces, dashes, or underscores.');
+            return;
+          }
+          if (!rawPlayerName || rawPlayerName.length > 20 || !/^[a-zA-Z0-9 _-]+$/.test(rawPlayerName)) {
+            rejectJoin('INVALID_NAME', 'Player names must be 1–20 letters, numbers, spaces, dashes, or underscores.');
+            return;
+          }
+          if (
+            msg.seed !== undefined &&
+            !((typeof msg.seed === 'string' && msg.seed.length <= 64) ||
+              (typeof msg.seed === 'number' && Number.isFinite(msg.seed)))
+          ) {
+            rejectJoin('INVALID_SEED', 'This world seed must be a short string or a finite number.');
+            return;
+          }
 
-          const color = PLAYER_AVATAR_COLORS[room.colorSeq % PLAYER_AVATAR_COLORS.length];
-          room.colorSeq += 1;
+          const roomId = normalizeRoomId(rawRoomId);
+          if (activeRoom?.roomId === roomId) return;
+          const room = rooms.get(roomId);
+          const playerName = normalizePlayerName(rawPlayerName);
+          if (room && room.players.size >= MAX_ROOM_PLAYERS) {
+            rejectJoin('ROOM_FULL', `This room is full (${MAX_ROOM_PLAYERS} players maximum).`);
+            return;
+          }
+          if (room && Array.from(room.players.values()).some(
+            (player) => player.info.name.toLowerCase() === playerName.toLowerCase()
+          )) {
+            rejectJoin('NAME_IN_USE', 'That player name is already being used in this room. Choose another name.');
+            return;
+          }
+
+          leaveCurrentRoom();
+          const seed = msg.seed ?? 'alpine-valley-2026';
+          const joinedRoom = getOrCreateRoom(roomId, seed);
+          activeRoom = joinedRoom;
+
+          const color = PLAYER_AVATAR_COLORS[joinedRoom.colorSeq % PLAYER_AVATAR_COLORS.length];
+          joinedRoom.colorSeq += 1;
 
           const info: RoomPlayer = {
             id: clientId,
-            name: normalizePlayerName(msg.playerName),
+            name: playerName,
             color,
-            x: Number.isFinite(msg.x) ? msg.x : 8.5,
-            y: Number.isFinite(msg.y) ? msg.y : 42,
-            z: Number.isFinite(msg.z) ? msg.z : 8.5,
+            x: isWithinWorldBorder(msg.x) ? msg.x : 8.5,
+            y: Number.isFinite(msg.y) && msg.y >= 0 && msg.y <= 256 ? msg.y : 42,
+            z: isWithinWorldBorder(msg.z) ? msg.z : 8.5,
             yaw: Number.isFinite(msg.yaw) ? msg.yaw : 0,
-            pitch: Number.isFinite(msg.pitch) ? msg.pitch : 0,
+            pitch: Number.isFinite(msg.pitch) && Math.abs(msg.pitch) <= Math.PI / 2 ? msg.pitch : 0,
           };
 
-          const existingPlayers = Array.from(room.players.values()).map((p) => p.info);
-          room.players.set(clientId, { socket, info });
+          const existingPlayers = Array.from(joinedRoom.players.values()).map((p) => p.info);
+          joinedRoom.players.set(clientId, { socket, info });
 
           socket.send(
             encodePacket(MP_MESSAGES.ROOM_STATE, {
               clientId,
-              roomId: room.roomId,
-              seed: room.seed,
-              timeOfDay: room.timeOfDay,
+              roomId: joinedRoom.roomId,
+              seed: joinedRoom.seed,
+              timeOfDay: joinedRoom.timeOfDay,
               players: existingPlayers,
-              blocks: Array.from(room.blocks.values()),
+              blocks: Array.from(joinedRoom.blocks.values()),
             })
           );
 
           broadcastToRoom(
-            room,
+            joinedRoom,
             encodePacket(MP_MESSAGES.PLAYER_JOINED, { player: info }),
             clientId
           );
@@ -169,7 +243,13 @@ export function attachMultiplayerServer(server: http.Server): {
           if (!activeRoom) return;
           const entry = activeRoom.players.get(clientId);
           if (!entry) return;
-          if (!Number.isFinite(msg.x) || !Number.isFinite(msg.y) || !Number.isFinite(msg.z)) {
+          if (
+            !isWithinWorldBorder(msg.x) ||
+            !isWithinWorldBorder(msg.z) ||
+            !Number.isFinite(msg.y) || msg.y < -64 || msg.y > 320 ||
+            (msg.yaw !== undefined && !Number.isFinite(msg.yaw)) ||
+            (msg.pitch !== undefined && (!Number.isFinite(msg.pitch) || Math.abs(msg.pitch) > Math.PI / 2))
+          ) {
             return;
           }
           entry.info.x = msg.x;
@@ -180,8 +260,22 @@ export function attachMultiplayerServer(server: http.Server): {
           if (typeof msg.sneaking === 'boolean') entry.info.sneaking = msg.sneaking;
           if (typeof msg.swinging === 'boolean') entry.info.swinging = msg.swinging;
           if (typeof msg.shielding === 'boolean') entry.info.shielding = msg.shielding;
-          if (msg.heldItemId !== undefined) entry.info.heldItemId = msg.heldItemId;
-          if (msg.armorIds !== undefined) entry.info.armorIds = msg.armorIds;
+          if (msg.heldItemId === null || (typeof msg.heldItemId === 'string' && msg.heldItemId.length <= 64)) {
+            entry.info.heldItemId = msg.heldItemId;
+          }
+          if (msg.armorIds === null) {
+            entry.info.armorIds = null;
+          } else if (msg.armorIds && typeof msg.armorIds === 'object' && !Array.isArray(msg.armorIds)) {
+            const validSlots = ['helmet', 'chestplate', 'leggings', 'boots'];
+            const armor: Record<string, string | null> = {};
+            for (const slot of validSlots) {
+              const itemId = msg.armorIds[slot];
+              if (itemId === null || (typeof itemId === 'string' && itemId.length <= 64)) {
+                armor[slot] = itemId;
+              }
+            }
+            entry.info.armorIds = armor;
+          }
           if (typeof msg.ridingBoat === 'boolean') entry.info.ridingBoat = msg.ridingBoat;
 
           broadcastToRoom(
@@ -207,26 +301,22 @@ export function attachMultiplayerServer(server: http.Server): {
 
         case MP_MESSAGES.BLOCK_SET: {
           if (!activeRoom) return;
-          const x = Math.floor(Number(msg.x));
-          const y = Math.floor(Number(msg.y));
-          const z = Math.floor(Number(msg.z));
-          const blockId = Math.floor(Number(msg.blockId));
-          const fluidData = Math.floor(Number(msg.fluidData) || 0);
-
+          const { x, y, z, blockId } = msg;
+          const fluidData = msg.fluidData === undefined ? 0 : msg.fluidData;
           if (
-            !Number.isFinite(x) ||
-            !Number.isFinite(y) ||
-            !Number.isFinite(z) ||
-            y < 0 ||
-            y >= 128 ||
-            !Number.isFinite(blockId) ||
-            blockId < 0
+            !Number.isSafeInteger(x) || !isWithinWorldBorder(x) ||
+            !Number.isSafeInteger(z) || !isWithinWorldBorder(z) ||
+            !Number.isSafeInteger(y) || y < 0 || y >= 128 ||
+            !Number.isSafeInteger(blockId) || blockId < 0 || blockId > 65_535 ||
+            !Number.isSafeInteger(fluidData) || fluidData < 0 || fluidData > 8
           ) {
             return;
           }
 
+          const blockKey = `${x},${y},${z}`;
+          if (!activeRoom.blocks.has(blockKey) && activeRoom.blocks.size >= MAX_ROOM_BLOCKS) return;
           const delta: BlockDelta = { x, y, z, blockId, fluidData };
-          activeRoom.blocks.set(`${x},${y},${z}`, delta);
+          activeRoom.blocks.set(blockKey, delta);
 
           broadcastToRoom(
             activeRoom,
@@ -241,9 +331,9 @@ export function attachMultiplayerServer(server: http.Server): {
 
         case MP_MESSAGES.TIME_SET: {
           if (!activeRoom) return;
-          const rawTod = Number(msg.timeOfDay);
-          if (!Number.isFinite(rawTod)) return;
-          activeRoom.timeOfDay = ((rawTod % 1) + 1) % 1;
+          const rawTod = msg.timeOfDay;
+          if (typeof rawTod !== 'number' || !Number.isFinite(rawTod) || rawTod < 0 || rawTod > 1) return;
+          activeRoom.timeOfDay = rawTod === 1 ? 0 : rawTod;
           broadcastToRoom(
             activeRoom,
             encodePacket(MP_MESSAGES.TIME_UPDATED, {
@@ -259,8 +349,9 @@ export function attachMultiplayerServer(server: http.Server): {
           if (!activeRoom) return;
           const entry = activeRoom.players.get(clientId);
           if (!entry) return;
-          const text = String(msg.text || '').trim().slice(0, 180);
-          if (!text) return;
+          if (typeof msg.text !== 'string' || msg.text.length > 1_000) return;
+          const text = msg.text.trim().slice(0, 180);
+          if (!text || /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(text)) return;
 
           const chatPayload = encodePacket(MP_MESSAGES.CHAT_MESSAGE, {
             id: `${clientId}-${Date.now()}`,
