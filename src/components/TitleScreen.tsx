@@ -12,6 +12,7 @@ import {
   type OptionsSubPage,
 } from './ClassicOptionsModal';
 import type { StoredResourcePack } from '../game/ResourcePackManager';
+import { normalizeWebSocketUrl } from '../backend/network/MultiplayerProtocol.js';
 
 export type { GameOptionsState };
 
@@ -33,7 +34,8 @@ interface TitleScreenProps {
   onLoadWorld: (slotName: string) => void;
   onDeleteWorld: (slotName: string) => void;
   onImportWorldJson: (jsonText: string) => void;
-  onJoinMultiplayer: (roomId: string, playerName: string) => void;
+  onJoinMultiplayer: (roomId: string, playerName: string, serverUrl: string) => void;
+  onTestMultiplayerServer: (serverUrl: string) => Promise<{ ok: boolean; message: string }>;
   onUiClick: () => void;
 }
 
@@ -61,6 +63,7 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
   onDeleteWorld,
   onImportWorldJson,
   onJoinMultiplayer,
+  onTestMultiplayerServer,
   onUiClick,
 }) => {
   const [view, setView] = useState<SubView>('main');
@@ -71,6 +74,16 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
   const [newMode, setNewMode] = useState<'survival' | 'creative'>('survival');
   const [mpRoom, setMpRoom] = useState('lobby');
   const [mpPlayer, setMpPlayer] = useState(() => `Steve${Math.floor(100 + Math.random() * 900)}`);
+  const [mpServer, setMpServer] = useState(() => {
+    const configuredUrl = import.meta.env?.VITE_MULTIPLAYER_WS_URL?.trim();
+    if (configuredUrl) return configuredUrl;
+    if (typeof window === 'undefined') return '';
+    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    return `${protocol}//${window.location.host}/ws`;
+  });
+  const [mpError, setMpError] = useState('');
+  const [serverCheck, setServerCheck] = useState<'idle' | 'checking' | 'online' | 'offline'>('idle');
+  const [serverMessage, setServerMessage] = useState('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -97,6 +110,53 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
     };
     reader.readAsText(file);
     e.target.value = '';
+  };
+
+  const getValidatedServerUrl = () => {
+    try {
+      const pageUrl = typeof window === 'undefined' ? 'https://localhost' : window.location.href;
+      return normalizeWebSocketUrl(mpServer, pageUrl);
+    } catch (error) {
+      setMpError(error instanceof Error ? error.message : 'Enter a valid multiplayer server address.');
+      setServerCheck('offline');
+      setServerMessage('Server address needs attention.');
+      return null;
+    }
+  };
+
+  const handleTestServer = async () => {
+    onUiClick();
+    setMpError('');
+    const serverUrl = getValidatedServerUrl();
+    if (!serverUrl) return;
+    setServerCheck('checking');
+    setServerMessage('Checking WebSocket connection…');
+    try {
+      const result = await onTestMultiplayerServer(serverUrl);
+      setServerCheck(result.ok ? 'online' : 'offline');
+      setServerMessage(result.message);
+    } catch (error) {
+      setServerCheck('offline');
+      setServerMessage(error instanceof Error ? error.message : 'Server check failed.');
+    }
+  };
+
+  const handleJoinServer = () => {
+    onUiClick();
+    setMpError('');
+    const roomId = mpRoom.trim();
+    const playerName = mpPlayer.trim();
+    if (!roomId || roomId.length > 32 || !/^[a-zA-Z0-9 _-]+$/.test(roomId)) {
+      setMpError('Room IDs need 1–32 letters, numbers, spaces, dashes, or underscores.');
+      return;
+    }
+    if (!playerName || playerName.length > 20 || !/^[a-zA-Z0-9 _-]+$/.test(playerName)) {
+      setMpError('Player names need 1–20 letters, numbers, spaces, dashes, or underscores.');
+      return;
+    }
+    const serverUrl = getValidatedServerUrl();
+    if (!serverUrl) return;
+    onJoinMultiplayer(roomId, playerName, serverUrl);
   };
 
   return (
@@ -395,12 +455,55 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
       )}
 
       {view === 'multiplayer' && (
-        <div className="mc-panel-dark w-full max-w-lg p-5 flex flex-col gap-4 my-auto">
+        <div className="mc-panel-dark w-full max-w-lg p-5 flex flex-col gap-3.5 my-auto max-h-[calc(100dvh-7rem)] overflow-y-auto">
           <h2 className="text-lg font-bold mc-text-shadow text-center border-b border-white/15 pb-2">
             Play Multiplayer
           </h2>
           <p className="text-xs text-neutral-300 leading-relaxed">
-            Join a live WebSocket room with friends. All block edits, player avatars, and chat sync in real time.
+            Join a live WebSocket room with friends. Share the same server address and room ID to meet up.
+            Server checks can confirm that the address responds before you join.
+          </p>
+
+          <label className="flex flex-col gap-1 text-xs text-neutral-300">
+            <span>Server Address</span>
+            <input
+              type="text"
+              value={mpServer}
+              onChange={(e) => {
+                setMpServer(e.target.value);
+                setMpError('');
+                setServerCheck('idle');
+                setServerMessage('');
+              }}
+              className="bg-black border-2 border-neutral-500 px-3 py-2 text-sm text-white focus:border-white outline-none"
+              placeholder="play.example.com or wss://play.example.com/ws"
+              autoCapitalize="off"
+              autoComplete="url"
+              spellCheck={false}
+              inputMode="url"
+              maxLength={255}
+              aria-describedby="mp-server-help mp-server-status"
+            />
+            <span id="mp-server-help" className="text-[11px] text-neutral-400">
+              Hostname or ws:// / wss:// address. Secure pages require wss://.
+            </span>
+          </label>
+
+          <button
+            type="button"
+            className="mc-btn py-2 text-sm font-bold"
+            onClick={handleTestServer}
+            disabled={serverCheck === 'checking'}
+          >
+            {serverCheck === 'checking' ? 'Checking Server…' : 'Check Server'}
+          </button>
+          <p
+            id="mp-server-status"
+            role="status"
+            aria-live="polite"
+            className={`min-h-4 text-xs ${serverCheck === 'online' ? 'text-emerald-300' : serverCheck === 'offline' ? 'text-rose-300' : 'text-neutral-300'}`}
+          >
+            {serverMessage || 'A server check verifies WebSocket reachability, not whether a specific room is full.'}
           </p>
 
           <label className="flex flex-col gap-1 text-xs text-neutral-300">
@@ -408,10 +511,16 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
             <input
               type="text"
               value={mpPlayer}
-              onChange={(e) => setMpPlayer(e.target.value)}
+              onChange={(e) => {
+                setMpPlayer(e.target.value);
+                setMpError('');
+              }}
               className="bg-black border-2 border-neutral-500 px-3 py-2 text-sm text-white focus:border-white outline-none"
-              maxLength={18}
+              maxLength={20}
+              autoComplete="nickname"
+              aria-describedby="mp-name-help"
             />
+            <span id="mp-name-help" className="text-[11px] text-neutral-400">1–20 letters, numbers, spaces, dashes, or underscores.</span>
           </label>
 
           <label className="flex flex-col gap-1 text-xs text-neutral-300">
@@ -419,20 +528,24 @@ export const TitleScreen: React.FC<TitleScreenProps> = ({
             <input
               type="text"
               value={mpRoom}
-              onChange={(e) => setMpRoom(e.target.value)}
+              onChange={(e) => {
+                setMpRoom(e.target.value);
+                setMpError('');
+              }}
               className="bg-black border-2 border-neutral-500 px-3 py-2 text-sm text-white focus:border-white outline-none"
-              maxLength={24}
+              maxLength={32}
+              aria-describedby="mp-room-help"
             />
+            <span id="mp-room-help" className="text-[11px] text-neutral-400">1–32 letters, numbers, spaces, dashes, or underscores. Matching is case-insensitive.</span>
           </label>
+
+          {mpError && <p role="alert" className="text-xs text-rose-300">{mpError}</p>}
 
           <div className="grid grid-cols-2 gap-3 pt-1">
             <button
               type="button"
               className="mc-btn-green py-2.5 text-sm font-bold"
-              onClick={() => {
-                onUiClick();
-                onJoinMultiplayer(mpRoom.trim() || 'lobby', mpPlayer.trim() || 'Player');
-              }}
+              onClick={handleJoinServer}
             >
               Join Server Room
             </button>

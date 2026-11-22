@@ -31,6 +31,7 @@ export const ENGINE_EVENTS = Object.freeze({
   ENTITY_KILLED: 'entity:killed',
   MP_CONNECTED: 'mp:connected',
   MP_DISCONNECTED: 'mp:disconnected',
+  MP_CONNECTION_FAILED: 'mp:connection_failed',
   MP_PLAYER_JOINED: 'mp:player_joined',
   MP_PLAYER_LEFT: 'mp:player_left',
   MP_CHAT: 'mp:chat',

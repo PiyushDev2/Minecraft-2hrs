@@ -7,9 +7,11 @@ import {
   BLOCK_IDS,
   ENGINE_EVENTS,
   IndexedDBSave,
+  MultiplayerClient,
   WorldManager,
   WorldSave,
 } from '../../src/backend/index.js';
+import { decodePacket, MP_MESSAGES, normalizeWebSocketUrl } from '../../src/backend/network/MultiplayerProtocol.js';
 import { attachMultiplayerServer } from '../../server.ts';
 
 function waitForEvent(bus, eventName, predicate = () => true, timeoutMs = 4000) {
@@ -25,6 +27,23 @@ function waitForEvent(bus, eventName, predicate = () => true, timeoutMs = 4000) 
         resolve(payload);
       }
     });
+  });
+}
+
+function waitForSocketPacket(socket, predicate, timeoutMs = 4000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      socket.off('message', onMessage);
+      reject(new Error('Timed out waiting for multiplayer packet'));
+    }, timeoutMs);
+    const onMessage = (raw) => {
+      const packet = decodePacket(raw.toString());
+      if (!packet || !predicate(packet)) return;
+      clearTimeout(timer);
+      socket.off('message', onMessage);
+      resolve(packet);
+    };
+    socket.on('message', onMessage);
   });
 }
 
@@ -67,6 +86,124 @@ test('IndexedDBSave & WorldManager support multi-slot async saves, listing, dele
   } finally {
     wm.dispose();
     IndexedDBSave.clearFallbackCache();
+  }
+});
+
+test('Multiplayer client reports when a socket closes before its room join is acknowledged', async () => {
+  const wm = new WorldManager({ seed: 'join-failure-test', viewDistance: 3 });
+
+  class FakeWebSocket {
+    static instance;
+
+    constructor(url) {
+      this.url = url;
+      this.readyState = 0;
+      this.listeners = new Map();
+      FakeWebSocket.instance = this;
+    }
+
+    addEventListener(name, listener) {
+      this.listeners.set(name, listener);
+    }
+
+    send() {}
+
+    close() {
+      this.readyState = 3;
+    }
+
+    dispatch(name, event = {}) {
+      this.listeners.get(name)?.(event);
+    }
+  }
+
+  try {
+    wm.network._maxReconnectAttempts = 0;
+    const failurePromise = waitForEvent(wm.bus, ENGINE_EVENTS.MP_CONNECTION_FAILED);
+    wm.network.connect({
+      roomId: 'Friends Room',
+      playerName: 'Alice',
+      url: 'wss://multiplayer.example.test/ws',
+      WebSocketImpl: FakeWebSocket,
+    });
+
+    const socket = FakeWebSocket.instance;
+    socket.readyState = 1;
+    socket.dispatch('open');
+    assert.equal(wm.network.status, 'connecting', 'socket open alone must not count as joining');
+
+    socket.readyState = 3;
+    socket.dispatch('close', { code: 1006, reason: 'No multiplayer service' });
+    const failure = await failurePromise;
+    assert.equal(failure.roomId, 'friends-room');
+    assert.equal(failure.reason, 'No multiplayer service');
+    assert.equal(failure.attempts, 1);
+    assert.equal(wm.network.status, 'disconnected');
+  } finally {
+    wm.dispose();
+  }
+});
+
+test('Multiplayer server addresses are normalized and reject insecure or malformed targets', () => {
+  assert.equal(normalizeWebSocketUrl('play.example.com', 'https://voxelcraft.example/'), 'wss://play.example.com/ws');
+  assert.equal(normalizeWebSocketUrl('http://localhost:3000', 'http://localhost:5173/'), 'ws://localhost:3000/ws');
+  assert.equal(normalizeWebSocketUrl('wss://play.example.com:8443/game', 'https://voxelcraft.example/'), 'wss://play.example.com:8443/game');
+  assert.throws(() => normalizeWebSocketUrl('ws://play.example.com', 'https://voxelcraft.example/'), /wss/);
+  assert.throws(() => normalizeWebSocketUrl('https://user:secret@play.example.com/ws'), /credentials/);
+  assert.throws(() => normalizeWebSocketUrl('javascript:alert(1)'), /valid server address/);
+});
+
+test('Multiplayer server passes a preflight ping and rejects duplicate room names', async () => {
+  const server = http.createServer();
+  const { wss, rooms } = attachMultiplayerServer(server);
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+  const wsUrl = `ws://127.0.0.1:${port}/ws`;
+  const clients = [];
+
+  try {
+    const check = await MultiplayerClient.testServerConnection(wsUrl, WebSocket);
+    assert.equal(check.ok, true);
+    assert.match(check.message, /responding/);
+
+    const first = new WebSocket(wsUrl);
+    clients.push(first);
+    await new Promise((resolve, reject) => {
+      first.once('open', resolve);
+      first.once('error', reject);
+    });
+    const roomState = waitForSocketPacket(first, (packet) => packet.type === MP_MESSAGES.ROOM_STATE);
+    first.send(JSON.stringify({
+      type: MP_MESSAGES.JOIN_ROOM,
+      roomId: 'shared-room',
+      playerName: 'Alex',
+      seed: 'test-seed',
+      x: 8.5,
+      y: 42,
+      z: 8.5,
+    }));
+    await roomState;
+
+    const second = new WebSocket(wsUrl);
+    clients.push(second);
+    await new Promise((resolve, reject) => {
+      second.once('open', resolve);
+      second.once('error', reject);
+    });
+    const rejected = waitForSocketPacket(second, (packet) => packet.type === MP_MESSAGES.ERROR);
+    second.send(JSON.stringify({
+      type: MP_MESSAGES.JOIN_ROOM,
+      roomId: 'shared-room',
+      playerName: 'alex',
+      seed: 'test-seed',
+    }));
+    const failure = await rejected;
+    assert.equal(failure.code, 'NAME_IN_USE');
+    assert.equal(rooms.get('shared-room').players.size, 1);
+  } finally {
+    for (const client of clients) client.terminate();
+    await new Promise((resolve) => wss.close(resolve));
+    await new Promise((resolve) => server.close(resolve));
   }
 });
 

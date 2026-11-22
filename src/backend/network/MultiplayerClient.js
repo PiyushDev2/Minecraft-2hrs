@@ -62,6 +62,10 @@ export class MultiplayerClient {
     this._reconnectAttempts = 0;
     /** @type {number} */
     this._maxReconnectAttempts = 3;
+    /** @type {ReturnType<typeof setTimeout>|null} */
+    this._joinTimeoutTimer = null;
+    /** @type {number} */
+    this._joinTimeoutMs = 10000;
 
     this._bindLocalWorldEdits();
   }
@@ -125,9 +129,79 @@ export class MultiplayerClient {
    * @returns {string}
    */
   static getDefaultWebSocketUrl() {
+    const configuredUrl = import.meta.env?.VITE_MULTIPLAYER_WS_URL?.trim();
+    if (configuredUrl) return configuredUrl;
     if (typeof window === 'undefined') return 'ws://127.0.0.1:3000/ws';
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     return `${proto}//${window.location.host}/ws`;
+  }
+
+  /**
+   * Performs a lightweight WebSocket ping check without joining a room.
+   * @param {string} url
+   * @param {typeof WebSocket} [WebSocketImpl]
+   * @returns {Promise<{ok: boolean, message: string}>}
+   */
+  static testServerConnection(url, WebSocketImpl = undefined) {
+    const WS = WebSocketImpl ?? (typeof WebSocket !== 'undefined' ? WebSocket : null);
+    if (!WS) return Promise.resolve({ ok: false, message: 'WebSocket is unavailable in this browser.' });
+
+    return new Promise((resolve) => {
+      let socket;
+      let settled = false;
+      let timer;
+      const finish = (ok, message) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          if (socket && socket.readyState !== 3) socket.close();
+        } catch {
+          // Ignore close errors from sockets that failed to open.
+        }
+        resolve({ ok, message });
+      };
+
+      try {
+        socket = new WS(url);
+      } catch {
+        finish(false, 'Could not open a WebSocket connection. Check the address and server status.');
+        return;
+      }
+
+      const timestamp = Date.now();
+      const onOpen = () => {
+        try {
+          socket.send(encodePacket(MP_MESSAGES.PING, { ts: timestamp }));
+        } catch {
+          finish(false, 'The server connection opened but the ping could not be sent.');
+        }
+      };
+      const onMessage = (event) => {
+        const raw = typeof event.data === 'string' ? event.data : String(event.data);
+        const packet = decodePacket(raw);
+        if (packet?.type === MP_MESSAGES.PONG && packet.ts === timestamp) {
+          finish(true, 'Server is online and responding to multiplayer checks.');
+        }
+      };
+      const onError = () => finish(false, 'Could not reach that multiplayer server. Check its address and WebSocket support.');
+      const onClose = () => finish(false, 'The server closed the connection before completing its check.');
+
+      if (typeof socket.addEventListener === 'function') {
+        socket.addEventListener('open', onOpen);
+        socket.addEventListener('message', onMessage);
+        socket.addEventListener('error', onError);
+        socket.addEventListener('close', onClose);
+      } else {
+        socket.onopen = onOpen;
+        socket.onmessage = onMessage;
+        socket.onerror = onError;
+        socket.onclose = onClose;
+      }
+      timer = setTimeout(() => {
+        finish(false, 'No multiplayer response yet. Check that the server is running and reachable.');
+      }, 5000);
+    });
   }
 
   /**
@@ -161,12 +235,22 @@ export class MultiplayerClient {
       throw new Error('WebSocket implementation is unavailable in this runtime.');
     }
 
-    const socket = new WS(url);
+    let socket;
+    try {
+      socket = new WS(url);
+    } catch (error) {
+      this.status = 'disconnected';
+      this.worldManager.bus.emit(ENGINE_EVENTS.MP_CONNECTION_FAILED, {
+        roomId: this.roomId,
+        reason: error instanceof Error ? error.message : 'Invalid WebSocket URL',
+        attempts: this._reconnectAttempts + 1,
+      });
+      return;
+    }
     this.socket = socket;
 
     const handleOpen = () => {
       if (this.socket !== socket) return;
-      this._reconnectAttempts = 0;
       const pos = this.worldManager.player.getPosition();
       const rot = this.worldManager.player.getRotation();
       socket.send(
@@ -181,6 +265,11 @@ export class MultiplayerClient {
           pitch: rot.pitch,
         })
       );
+      this._joinTimeoutTimer = setTimeout(() => {
+        if (this.socket === socket && this.status !== 'connected') {
+          socket.close(4000, 'Room join timed out');
+        }
+      }, this._joinTimeoutMs);
     };
 
     const handleMessage = (event) => {
@@ -195,35 +284,41 @@ export class MultiplayerClient {
       if (this.socket !== socket) return;
     };
 
-    const handleClose = () => {
+    const handleClose = (event = {}) => {
       if (this.socket !== socket) return;
+      if (this._joinTimeoutTimer !== null) {
+        clearTimeout(this._joinTimeoutTimer);
+        this._joinTimeoutTimer = null;
+      }
       this.status = 'disconnected';
       this.clientId = null;
       this._clearRemotePlayers();
+      const reason = event.reason || (event.code ? `WebSocket closed (${event.code})` : 'Connection closed');
       this.worldManager.bus.emit(ENGINE_EVENTS.MP_DISCONNECTED, {
         roomId: this.roomId,
+        reason,
       });
 
-      if (
-        !this._manualDisconnect &&
-        this._reconnectAttempts < this._maxReconnectAttempts &&
-        typeof setTimeout !== 'undefined'
-      ) {
+      if (!this._manualDisconnect && this._reconnectAttempts < this._maxReconnectAttempts) {
         this._reconnectAttempts += 1;
         const delayMs = 2500 * this._reconnectAttempts;
-        this._reconnectTimer = /** @type {any} */ (
-          setTimeout(() => {
-            if (!this._manualDisconnect && this.serverUrl) {
-              this.connect({
-                roomId: this.roomId,
-                playerName: this.playerName,
-                url: this.serverUrl,
-                WebSocketImpl,
-                isReconnect: true,
-              });
-            }
-          }, delayMs)
-        );
+        this._reconnectTimer = setTimeout(() => {
+          if (!this._manualDisconnect && this.serverUrl) {
+            this.connect({
+              roomId: this.roomId,
+              playerName: this.playerName,
+              url: this.serverUrl,
+              WebSocketImpl,
+              isReconnect: true,
+            });
+          }
+        }, delayMs);
+      } else if (!this._manualDisconnect) {
+        this.worldManager.bus.emit(ENGINE_EVENTS.MP_CONNECTION_FAILED, {
+          roomId: this.roomId,
+          reason,
+          attempts: this._reconnectAttempts + 1,
+        });
       }
     };
 
@@ -248,6 +343,10 @@ export class MultiplayerClient {
     if (this._reconnectTimer !== null) {
       clearTimeout(this._reconnectTimer);
       this._reconnectTimer = null;
+    }
+    if (this._joinTimeoutTimer !== null) {
+      clearTimeout(this._joinTimeoutTimer);
+      this._joinTimeoutTimer = null;
     }
     if (this.socket) {
       const sock = this.socket;
@@ -391,7 +490,34 @@ export class MultiplayerClient {
   /** @private */
   _handlePacket(msg) {
     switch (msg.type) {
+      case MP_MESSAGES.ERROR: {
+        if (this._joinTimeoutTimer !== null) {
+          clearTimeout(this._joinTimeoutTimer);
+          this._joinTimeoutTimer = null;
+        }
+        const reason = typeof msg.message === 'string' ? msg.message : 'The server rejected the room join.';
+        this._manualDisconnect = true;
+        this.status = 'disconnected';
+        this.worldManager.bus.emit(ENGINE_EVENTS.MP_CONNECTION_FAILED, {
+          roomId: this.roomId,
+          code: msg.code || 'JOIN_REJECTED',
+          reason,
+          attempts: Math.max(1, this._reconnectAttempts + 1),
+        });
+        try {
+          this.socket?.close(4003, reason.slice(0, 120));
+        } catch {
+          // The close event will clean up any socket that is still open.
+        }
+        break;
+      }
+
       case MP_MESSAGES.ROOM_STATE: {
+        if (this._joinTimeoutTimer !== null) {
+          clearTimeout(this._joinTimeoutTimer);
+          this._joinTimeoutTimer = null;
+        }
+        this._reconnectAttempts = 0;
         this.status = 'connected';
         this.clientId = msg.clientId;
         this.roomId = msg.roomId;

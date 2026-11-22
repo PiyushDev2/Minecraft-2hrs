@@ -32,6 +32,45 @@ export const PLAYER_AVATAR_COLORS = Object.freeze([
 ]);
 
 /**
+ * Validates and normalizes a multiplayer server address for browser WebSockets.
+ * Bare hostnames are accepted and use the current page's security scheme.
+ * @param {string} raw
+ * @param {string} [pageUrl='https://localhost']
+ * @returns {string}
+ */
+export function normalizeWebSocketUrl(raw, pageUrl = 'https://localhost') {
+  const value = String(raw || '').trim();
+  if (!value) throw new Error('Enter a multiplayer server address.');
+
+  let candidate = value;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate)) {
+    const pageProtocol = new URL(pageUrl).protocol;
+    candidate = `${pageProtocol === 'https:' ? 'wss:' : 'ws:'}//${candidate}`;
+  }
+
+  let url;
+  try {
+    url = new URL(candidate);
+  } catch {
+    throw new Error('Enter a valid server address, such as play.example.com.');
+  }
+
+  if (url.protocol === 'http:') url.protocol = 'ws:';
+  if (url.protocol === 'https:') url.protocol = 'wss:';
+  if (url.protocol !== 'ws:' && url.protocol !== 'wss:') {
+    throw new Error('Server addresses must use ws:// or wss://.');
+  }
+  if (!url.hostname || url.username || url.password || url.search || url.hash) {
+    throw new Error('Use a hostname and optional path only; credentials, query strings, and fragments are not allowed.');
+  }
+  if (new URL(pageUrl).protocol === 'https:' && url.protocol !== 'wss:') {
+    throw new Error('Secure game pages can only connect to wss:// servers.');
+  }
+  if (!url.pathname || url.pathname === '/') url.pathname = '/ws';
+  return url.toString();
+}
+
+/**
  * Sanitizes a room ID string to safe alphanumeric/dash tokens.
  * @param {string} raw
  * @returns {string}
