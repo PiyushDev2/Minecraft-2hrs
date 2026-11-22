@@ -1,35 +1,26 @@
 /**
  * @file MobTypes.js
- * @description Defines passive and hostile voxel mob archetypes, dimensions, speeds,
- * health, loot drops, and visual palette specs.
+ * @description Defines passive, neutral, and hostile voxel mob archetypes:
+ * Sheep, Cow, Pig, Chicken, Zombie, Slime, Creeper, Skeleton, Spider, Enderman, and Zombified Piglin.
  */
 
 export const MOB_TYPES = Object.freeze({
   SHEEP: 'sheep',
   COW: 'cow',
+  PIG: 'pig',
+  CHICKEN: 'chicken',
   ZOMBIE: 'zombie',
   SLIME: 'slime',
+  CREEPER: 'creeper',
+  SKELETON: 'skeleton',
+  SPIDER: 'spider',
+  ENDERMAN: 'enderman',
+  ZOMBIFIED_PIGLIN: 'zombified_piglin',
+  BLAZE: 'blaze',
+  VILLAGER: 'villager',
+  WOLF: 'wolf',
 });
 
-/**
- * @typedef {Object} MobDefinition
- * @property {string} type
- * @property {string} name
- * @property {'passive'|'hostile'} category
- * @property {number} width
- * @property {number} height
- * @property {number} maxHealth
- * @property {number} walkSpeed
- * @property {number} chaseSpeed
- * @property {number} attackDamage
- * @property {number} attackRange
- * @property {number} detectRange
- * @property {boolean} burnsInSunlight
- * @property {Array<{ itemId: string, count: number, chance?: number }>} drops
- * @property {{ primary: number, secondary: number, accent: number }} palette
- */
-
-/** @type {Record<string, MobDefinition>} */
 export const MOB_DEFINITIONS = Object.freeze({
   [MOB_TYPES.SHEEP]: {
     type: MOB_TYPES.SHEEP,
@@ -44,7 +35,11 @@ export const MOB_DEFINITIONS = Object.freeze({
     attackRange: 0,
     detectRange: 10,
     burnsInSunlight: false,
-    drops: [{ itemId: 'raw_beef', count: 1, chance: 1 }],
+    xpValue: 2,
+    drops: [
+      { itemId: 'white_wool', count: 1, chance: 1 },
+      { itemId: 'raw_beef', count: 1, chance: 0.75 },
+    ],
     palette: { primary: 0xf2f0eb, secondary: 0xd9c2a3, accent: 0x3a3734 },
   },
   [MOB_TYPES.COW]: {
@@ -60,8 +55,49 @@ export const MOB_DEFINITIONS = Object.freeze({
     attackRange: 0,
     detectRange: 10,
     burnsInSunlight: false,
-    drops: [{ itemId: 'raw_beef', count: 2, chance: 1 }],
+    xpValue: 2,
+    drops: [
+      { itemId: 'raw_beef', count: 2, chance: 1 },
+      { itemId: 'leather', count: 1, chance: 0.85 },
+    ],
     palette: { primary: 0x5c402c, secondary: 0xd9d2c5, accent: 0x2a2018 },
+  },
+  [MOB_TYPES.PIG]: {
+    type: MOB_TYPES.PIG,
+    name: 'Pig',
+    category: 'passive',
+    width: 0.85,
+    height: 0.95,
+    maxHealth: 10,
+    walkSpeed: 1.9,
+    chaseSpeed: 3.6,
+    attackDamage: 0,
+    attackRange: 0,
+    detectRange: 10,
+    burnsInSunlight: false,
+    xpValue: 2,
+    drops: [{ itemId: 'raw_porkchop', count: 2, chance: 1 }],
+    palette: { primary: 0xf29ca6, secondary: 0xd97c88, accent: 0x291a1c },
+  },
+  [MOB_TYPES.CHICKEN]: {
+    type: MOB_TYPES.CHICKEN,
+    name: 'Chicken',
+    category: 'passive',
+    width: 0.55,
+    height: 0.72,
+    maxHealth: 4,
+    walkSpeed: 2.1,
+    chaseSpeed: 3.8,
+    attackDamage: 0,
+    attackRange: 0,
+    detectRange: 10,
+    burnsInSunlight: false,
+    xpValue: 1,
+    drops: [
+      { itemId: 'raw_chicken', count: 1, chance: 1 },
+      { itemId: 'feather', count: 2, chance: 0.85 },
+    ],
+    palette: { primary: 0xf8fafc, secondary: 0xe6a629, accent: 0xd93636 },
   },
   [MOB_TYPES.ZOMBIE]: {
     type: MOB_TYPES.ZOMBIE,
@@ -76,11 +112,69 @@ export const MOB_DEFINITIONS = Object.freeze({
     attackRange: 1.65,
     detectRange: 18,
     burnsInSunlight: true,
+    xpValue: 5,
     drops: [
       { itemId: 'coal', count: 1, chance: 0.65 },
       { itemId: 'iron_ingot', count: 1, chance: 0.2 },
     ],
     palette: { primary: 0x4b7f48, secondary: 0x268596, accent: 0x353b73 },
+  },
+  [MOB_TYPES.CREEPER]: {
+    type: MOB_TYPES.CREEPER,
+    name: 'Creeper',
+    category: 'hostile',
+    width: 0.65,
+    height: 1.75,
+    maxHealth: 20,
+    walkSpeed: 1.85,
+    chaseSpeed: 3.35,
+    attackDamage: 0,
+    attackRange: 2.75,
+    detectRange: 16,
+    burnsInSunlight: false,
+    explosive: true,
+    xpValue: 5,
+    drops: [{ itemId: 'gunpowder', count: 2, chance: 0.9 }],
+    palette: { primary: 0x4db546, secondary: 0x2e7d2b, accent: 0x111811 },
+  },
+  [MOB_TYPES.SKELETON]: {
+    type: MOB_TYPES.SKELETON,
+    name: 'Skeleton',
+    category: 'hostile',
+    width: 0.65,
+    height: 1.85,
+    maxHealth: 20,
+    walkSpeed: 1.9,
+    chaseSpeed: 3.1,
+    attackDamage: 3,
+    attackRange: 13,
+    detectRange: 18,
+    burnsInSunlight: true,
+    ranged: true,
+    xpValue: 5,
+    drops: [
+      { itemId: 'bone', count: 2, chance: 0.9 },
+      { itemId: 'arrow', count: 3, chance: 0.85 },
+    ],
+    palette: { primary: 0xd9d7cf, secondary: 0x8f8e88, accent: 0x242424 },
+  },
+  [MOB_TYPES.SPIDER]: {
+    type: MOB_TYPES.SPIDER,
+    name: 'Spider',
+    category: 'hostile',
+    width: 1.15,
+    height: 0.85,
+    maxHealth: 16,
+    walkSpeed: 2.35,
+    chaseSpeed: 4.15,
+    attackDamage: 2,
+    attackRange: 1.75,
+    detectRange: 16,
+    burnsInSunlight: false,
+    climbsWalls: true,
+    xpValue: 5,
+    drops: [{ itemId: 'string', count: 2, chance: 0.9 }],
+    palette: { primary: 0x2c282b, secondary: 0x453e42, accent: 0xdc2626 },
   },
   [MOB_TYPES.SLIME]: {
     type: MOB_TYPES.SLIME,
@@ -95,19 +189,107 @@ export const MOB_DEFINITIONS = Object.freeze({
     attackRange: 1.4,
     detectRange: 14,
     burnsInSunlight: false,
+    xpValue: 3,
     drops: [
       { itemId: 'apple', count: 1, chance: 0.45 },
       { itemId: 'stick', count: 2, chance: 0.55 },
     ],
     palette: { primary: 0x67c954, secondary: 0x489c39, accent: 0x1e3819 },
   },
+  [MOB_TYPES.ENDERMAN]: {
+    type: MOB_TYPES.ENDERMAN,
+    name: 'Enderman',
+    category: 'neutral',
+    width: 0.65,
+    height: 2.75,
+    maxHealth: 40,
+    walkSpeed: 2.2,
+    chaseSpeed: 4.8,
+    attackDamage: 6,
+    attackRange: 2.1,
+    detectRange: 24,
+    burnsInSunlight: false,
+    xpValue: 5,
+    drops: [{ itemId: 'ender_pearl', count: 1, chance: 0.8 }],
+    palette: { primary: 0x16161a, secondary: 0x24242b, accent: 0xe879f9 },
+  },
+  [MOB_TYPES.ZOMBIFIED_PIGLIN]: {
+    type: MOB_TYPES.ZOMBIFIED_PIGLIN,
+    name: 'Zombified Piglin',
+    category: 'neutral',
+    width: 0.65,
+    height: 1.85,
+    maxHealth: 20,
+    walkSpeed: 2.0,
+    chaseSpeed: 3.9,
+    attackDamage: 5,
+    attackRange: 1.75,
+    detectRange: 20,
+    burnsInSunlight: false,
+    fireImmune: true,
+    xpValue: 5,
+    drops: [{ itemId: 'gold_ingot', count: 1, chance: 0.65 }],
+    palette: { primary: 0xe89ca6, secondary: 0x5b8a42, accent: 0xfacc15 },
+  },
+  [MOB_TYPES.BLAZE]: {
+    type: MOB_TYPES.BLAZE,
+    name: 'Blaze',
+    category: 'hostile',
+    width: 0.72,
+    height: 1.8,
+    maxHealth: 20,
+    walkSpeed: 2.2,
+    chaseSpeed: 3.6,
+    attackDamage: 5,
+    attackRange: 16,
+    detectRange: 22,
+    burnsInSunlight: false,
+    fireImmune: true,
+    floating: true,
+    ranged: true,
+    projectileType: 'fireball',
+    xpValue: 10,
+    drops: [{ itemId: 'blaze_rod', count: 2, chance: 0.85 }],
+    palette: { primary: 0xf59e0b, secondary: 0x451a03, accent: 0xfef08a },
+  },
+  [MOB_TYPES.VILLAGER]: {
+    type: MOB_TYPES.VILLAGER,
+    name: 'Villager',
+    category: 'passive',
+    width: 0.65,
+    height: 1.92,
+    maxHealth: 20,
+    walkSpeed: 1.65,
+    chaseSpeed: 2.8,
+    attackDamage: 0,
+    attackRange: 0,
+    detectRange: 10,
+    burnsInSunlight: false,
+    interactable: true,
+    xpValue: 0,
+    drops: [],
+    palette: { primary: 0xb88663, secondary: 0x6b4423, accent: 0x22c55e },
+  },
+  [MOB_TYPES.WOLF]: {
+    type: MOB_TYPES.WOLF,
+    name: 'Wolf',
+    category: 'neutral',
+    width: 0.68,
+    height: 0.88,
+    maxHealth: 12,
+    walkSpeed: 2.2,
+    chaseSpeed: 4.5,
+    attackDamage: 4,
+    attackRange: 1.6,
+    detectRange: 18,
+    burnsInSunlight: false,
+    tameable: true,
+    xpValue: 2,
+    drops: [],
+    palette: { primary: 0xd6d3d1, secondary: 0x78716c, accent: 0xdc2626 },
+  },
 });
 
-/**
- * Resolves a mob definition safely by type.
- * @param {string} type
- * @returns {MobDefinition|undefined}
- */
 export function getMobDefinition(type) {
   return MOB_DEFINITIONS[type];
 }

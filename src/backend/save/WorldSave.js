@@ -22,9 +22,18 @@ export class WorldSave {
    * @returns {{ version: number, name: string, savedAt: string, seed: number, worldTime: number, timeOfDay: number, viewDistance: number, totalModifiedBlocks: number, gameMode?: string, inventory?: any, survival?: any, player: any, modifications: Record<string, Array<[number, number] | [number, number, number]>> }}
    */
   static serialize(world, player = null, name = 'default', extra = undefined) {
+    const dimMods = world.exportAllDimensionModifications
+      ? world.exportAllDimensionModifications()
+      : { overworld: world.chunkManager.exportAllModifications(), nether: {}, end: {} };
     const modifications = world.chunkManager.exportAllModifications();
     let totalModifiedBlocks = 0;
-    for (const list of Object.values(modifications)) {
+    for (const list of Object.values(dimMods.overworld || {})) {
+      totalModifiedBlocks += list.length;
+    }
+    for (const list of Object.values(dimMods.nether || {})) {
+      totalModifiedBlocks += list.length;
+    }
+    for (const list of Object.values(dimMods.end || {})) {
       totalModifiedBlocks += list.length;
     }
 
@@ -33,6 +42,7 @@ export class WorldSave {
       name,
       savedAt: new Date().toISOString(),
       seed: world.seed,
+      dimension: world.dimension ?? 'overworld',
       worldTime: world.worldTime,
       timeOfDay: world.timeOfDay,
       viewDistance: world.viewDistance,
@@ -40,6 +50,14 @@ export class WorldSave {
       ...(extra?.gameMode ? { gameMode: extra.gameMode } : {}),
       ...(extra?.inventory ? { inventory: extra.inventory } : {}),
       ...(extra?.survival ? { survival: extra.survival } : {}),
+      ...(extra?.blockEntities ? { blockEntities: extra.blockEntities } : {}),
+      ...(extra?.overworldBlockEntities ? { overworldBlockEntities: extra.overworldBlockEntities } : {}),
+      ...(extra?.netherBlockEntities ? { netherBlockEntities: extra.netherBlockEntities } : {}),
+      ...(extra?.endBlockEntities ? { endBlockEntities: extra.endBlockEntities } : {}),
+      ...(extra?.advancements ? { advancements: extra.advancements } : {}),
+      ...(typeof extra?.dragonDefeated === 'boolean' ? { dragonDefeated: extra.dragonDefeated } : {}),
+      ...(extra?.spawnPoint ? { spawnPoint: extra.spawnPoint } : {}),
+      ...(extra?.weather ? { weather: extra.weather } : {}),
       player: player
         ? {
             position: player.getPosition(),
@@ -48,6 +66,9 @@ export class WorldSave {
           }
         : null,
       modifications,
+      overworldModifications: dimMods.overworld,
+      netherModifications: dimMods.nether,
+      endModifications: dimMods.end || {},
     };
   }
 
@@ -86,19 +107,34 @@ export class WorldSave {
     const spawnCenter = saveData.player?.position
       ? { x: saveData.player.position.x, z: saveData.player.position.z }
       : { x: 8, z: 8 };
+    const savedDimension =
+      saveData.dimension === 'nether' ? 'nether' : saveData.dimension === 'end' ? 'end' : 'overworld';
 
     if (typeof saveData.viewDistance === 'number') {
       world.setViewDistance(saveData.viewDistance);
     }
 
-    // Regenerate world cleanly with saved seed (without meshing before applying mods)
-    world.generate(saveData.seed, { spawnCenter, pregenerateRadius: -1 });
+    // Regenerate world cleanly with saved seed & dimension (without meshing before applying mods)
+    world.generate(saveData.seed, {
+      spawnCenter,
+      pregenerateRadius: -1,
+      dimension: savedDimension,
+    });
     world.worldTime = Number.isFinite(saveData.worldTime) ? saveData.worldTime : 0;
     if (Number.isFinite(saveData.timeOfDay)) {
       world.setTimeOfDay(saveData.timeOfDay);
     }
 
-    if (saveData.modifications) {
+    if (
+      world.importAllDimensionModifications &&
+      (saveData.overworldModifications || saveData.netherModifications || saveData.endModifications)
+    ) {
+      world.importAllDimensionModifications(
+        saveData.overworldModifications ?? (savedDimension === 'overworld' ? saveData.modifications : {}),
+        saveData.netherModifications ?? (savedDimension === 'nether' ? saveData.modifications : {}),
+        saveData.endModifications ?? (savedDimension === 'end' ? saveData.modifications : {})
+      );
+    } else if (saveData.modifications) {
       world.chunkManager.importModifications(saveData.modifications);
     }
 
@@ -160,6 +196,7 @@ export class WorldSave {
             seed: data.seed,
             savedAt: data.savedAt,
             totalModifiedBlocks: data.totalModifiedBlocks ?? 0,
+            gameMode: data.gameMode,
           });
         } catch {
           // Ignore corrupted entries
@@ -187,7 +224,11 @@ export class WorldSave {
    */
   static async saveAsync(world, player = null, slotName = 'default', extra = undefined) {
     const payload = WorldSave.serialize(world, player, slotName, extra);
-    return IndexedDBSave.put(slotName, payload);
+    try {
+      return await IndexedDBSave.put(slotName, payload);
+    } catch {
+      return WorldSave.saveToStorage(world, player, slotName, extra);
+    }
   }
 
   /**
@@ -196,8 +237,12 @@ export class WorldSave {
    * @returns {Promise<any|null>}
    */
   static async loadAsync(slotName = 'default') {
-    const idbData = await IndexedDBSave.get(slotName);
-    if (idbData) return idbData;
+    try {
+      const idbData = await IndexedDBSave.get(slotName);
+      if (idbData) return idbData;
+    } catch {
+      // Fallback to localStorage below when IndexedDB is unavailable
+    }
     return WorldSave.loadFromStorage(slotName);
   }
 
@@ -206,7 +251,12 @@ export class WorldSave {
    * @returns {Promise<Array<{ slotName: string, seed: number, savedAt: string, totalModifiedBlocks: number, gameMode?: string, byteSize?: number }>>}
    */
   static async listSavesAsync() {
-    const idbList = await IndexedDBSave.list();
+    let idbList = [];
+    try {
+      idbList = await IndexedDBSave.list();
+    } catch {
+      idbList = [];
+    }
     const seen = new Set(idbList.map((s) => s.slotName));
     for (const legacy of WorldSave.listSaves()) {
       if (!seen.has(legacy.slotName)) {
@@ -221,7 +271,11 @@ export class WorldSave {
    * @param {string} slotName
    */
   static async deleteSaveAsync(slotName) {
-    await IndexedDBSave.delete(slotName);
+    try {
+      await IndexedDBSave.delete(slotName);
+    } catch {
+      // Continue deleting localStorage copy even if IndexedDB is blocked
+    }
     WorldSave.deleteSave(slotName);
   }
 }

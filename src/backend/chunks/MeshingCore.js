@@ -97,7 +97,12 @@ export function buildChunkGeometryBuffers({
   getFluidLevelAtLocal = () => 0,
   blockTable,
   tileRects,
+  yMin = 0,
+  yMax = CHUNK_HEIGHT,
 }) {
+  const clampedMin = Math.max(0, yMin | 0);
+  const clampedMax = Math.min(CHUNK_HEIGHT, yMax | 0);
+
   const opaque = runGreedyPass({
     getBlockAtLocal,
     getLightAtLocal,
@@ -105,6 +110,8 @@ export function buildChunkGeometryBuffers({
     blockTable,
     tileRects,
     waterPass: false,
+    yMin: clampedMin,
+    yMax: clampedMax,
   });
 
   const water = runGreedyPass({
@@ -114,6 +121,8 @@ export function buildChunkGeometryBuffers({
     blockTable,
     tileRects,
     waterPass: true,
+    yMin: clampedMin,
+    yMax: clampedMax,
   });
 
   const faceCount = (opaque?.faceCount ?? 0) + (water?.faceCount ?? 0);
@@ -167,6 +176,8 @@ function runGreedyPass({
   blockTable,
   tileRects,
   waterPass,
+  yMin = 0,
+  yMax = CHUNK_HEIGHT,
 }) {
   const positions = [];
   const normals = [];
@@ -186,25 +197,30 @@ function runGreedyPass({
   for (let d = 0; d < DIRECTIONS.length; d++) {
     const dir = DIRECTIONS[d];
     const { axis, uAxis, vAxis, step, normal, face, flipWinding } = dir;
-    const sliceCount = DIMS[axis];
-    const uSize = DIMS[uAxis];
-    const vSize = DIMS[vAxis];
+    const sStart = axis === 1 ? yMin : 0;
+    const sEnd = axis === 1 ? yMax : DIMS[axis];
+    const uStart = uAxis === 1 ? yMin : 0;
+    const uEnd = uAxis === 1 ? yMax : DIMS[uAxis];
+    const vStart = vAxis === 1 ? yMin : 0;
+    const vEnd = vAxis === 1 ? yMax : DIMS[vAxis];
+    const uSize = uEnd - uStart;
+    const vSize = vEnd - vStart;
 
     const mask = new Array(uSize * vSize);
 
-    for (let s = 0; s < sliceCount; s++) {
+    for (let s = sStart; s < sEnd; s++) {
       coord[axis] = s;
       neighborCoord[axis] = s + step;
 
       let hasAnyFace = false;
 
       for (let v = 0; v < vSize; v++) {
-        coord[vAxis] = v;
-        neighborCoord[vAxis] = v;
+        coord[vAxis] = vStart + v;
+        neighborCoord[vAxis] = vStart + v;
 
         for (let u = 0; u < uSize; u++) {
-          coord[uAxis] = u;
-          neighborCoord[uAxis] = u;
+          coord[uAxis] = uStart + u;
+          neighborCoord[uAxis] = uStart + u;
 
           const blockId = getBlockAtLocal(coord[0], coord[1], coord[2]);
           const maskIdx = v * uSize + u;
@@ -215,13 +231,21 @@ function runGreedyPass({
           }
 
           const def = blockTable[blockId];
-          if (!def || def.crossPlant) {
+          const shape = def?.renderShape || 'cube';
+          if (
+            !def ||
+            def.crossPlant ||
+            (shape !== 'cube' && shape !== 'half' && shape !== 'portal' && shape !== 'end_portal')
+          ) {
             mask[maskIdx] = null;
             continue;
           }
 
           const isWater = blockId === BLOCK_IDS.WATER;
-          if (waterPass !== isWater) {
+          const isPortal = blockId === BLOCK_IDS.NETHER_PORTAL || blockId === BLOCK_IDS.END_PORTAL;
+          const isTranslucent = isWater || isPortal;
+          const isLava = blockId === BLOCK_IDS.LAVA;
+          if (waterPass !== isTranslucent) {
             mask[maskIdx] = null;
             continue;
           }
@@ -234,8 +258,18 @@ function runGreedyPass({
           const nDef = blockTable[nBlockId];
           const nOccludes = Boolean(nDef?.occludesFaces);
 
-          if (waterPass) {
+          if (isWater) {
             if (nBlockId === BLOCK_IDS.WATER || nOccludes) {
+              mask[maskIdx] = null;
+              continue;
+            }
+          } else if (isPortal) {
+            if (nBlockId === blockId || nOccludes) {
+              mask[maskIdx] = null;
+              continue;
+            }
+          } else if (isLava) {
+            if (nBlockId === BLOCK_IDS.LAVA || nOccludes) {
               mask[maskIdx] = null;
               continue;
             }
@@ -244,23 +278,28 @@ function runGreedyPass({
             continue;
           }
 
-          const ao = waterPass
-            ? [3, 3, 3, 3]
-            : computeFaceAO(neighborCoord, uAxis, vAxis, getBlockAtLocal, blockTable);
+          const ao =
+            waterPass || isLava
+              ? [3, 3, 3, 3]
+              : computeFaceAO(neighborCoord, uAxis, vAxis, getBlockAtLocal, blockTable);
 
           const nLight = getLightAtLocal(neighborCoord[0], neighborCoord[1], neighborCoord[2]);
           const skyLight = nLight.sky;
           const blockLight = Math.max(nLight.block, def.lightEmission || 0);
 
           let waterTopOffset = 0;
-          if (waterPass) {
+          if (isWater || isLava) {
             const aboveId = getBlockAtLocal(coord[0], coord[1] + 1, coord[2]);
-            if (aboveId !== BLOCK_IDS.WATER && face !== BlockFace.BOTTOM) {
+            if (aboveId !== blockId && face !== BlockFace.BOTTOM) {
               const meta = getFluidLevelAtLocal(coord[0], coord[1], coord[2]);
               const isFalling = (meta & 0x10) !== 0;
               const dist = isFalling ? 0 : meta & 0x0f;
-              waterTopOffset = dist === 0 ? -0.12 : -Math.min(0.86, 0.12 + dist * 0.105);
+              waterTopOffset = dist === 0 ? -0.12 : -Math.min(0.86, 0.12 + dist * 0.14);
             }
+          } else if (def.renderShape === 'half' && face !== BlockFace.BOTTOM) {
+            waterTopOffset = -0.45;
+          } else if (def.renderShape === 'end_portal' && face !== BlockFace.BOTTOM) {
+            waterTopOffset = -0.25;
           }
 
           mask[maskIdx] = {
@@ -318,10 +357,12 @@ function runGreedyPass({
           const c2 = [0, 0, 0];
           const c3 = [0, 0, 0];
 
-          c0[axis] = planePos; c0[uAxis] = u;     c0[vAxis] = v;
-          c1[axis] = planePos; c1[uAxis] = u + w; c1[vAxis] = v;
-          c2[axis] = planePos; c2[uAxis] = u + w; c2[vAxis] = v + h;
-          c3[axis] = planePos; c3[uAxis] = u;     c3[vAxis] = v + h;
+          const wu = uStart + u;
+          const wv = vStart + v;
+          c0[axis] = planePos; c0[uAxis] = wu;     c0[vAxis] = wv;
+          c1[axis] = planePos; c1[uAxis] = wu + w; c1[vAxis] = wv;
+          c2[axis] = planePos; c2[uAxis] = wu + w; c2[vAxis] = wv + h;
+          c3[axis] = planePos; c3[uAxis] = wu;     c3[vAxis] = wv + h;
 
           if (waterTopOffset !== 0) {
             if (face === BlockFace.TOP) {
@@ -449,13 +490,171 @@ function runGreedyPass({
       }
     };
 
-    for (let y = 0; y < CHUNK_HEIGHT; y++) {
+    const emitBox = (x0, y0, z0, x1, y1, z1, rects, skyNorm, blockNorm) => {
+      const rTop = rects.top || rects.all || fallbackRect;
+      const rBot = rects.bottom || rects.all || rTop;
+      const rNorth = rects.north || rects.side || rects.all || rTop;
+      const rSouth = rects.south || rects.side || rects.all || rTop;
+      const rEast = rects.east || rects.side || rects.all || rTop;
+      const rWest = rects.west || rects.side || rects.all || rTop;
+
+      const emitFace = (p0, p1, p2, p3, nrm, rect, shade) => {
+        positions.push(
+          p0[0], p0[1], p0[2],
+          p1[0], p1[1], p1[2],
+          p2[0], p2[1], p2[2],
+          p3[0], p3[1], p3[2]
+        );
+        for (let i = 0; i < 4; i++) {
+          normals.push(nrm[0], nrm[1], nrm[2]);
+          tileRectArr.push(rect.u0, rect.v0, rect.uSize, rect.vSize);
+          lights.push(skyNorm, blockNorm);
+          colors.push(shade, shade, shade);
+        }
+        uvs.push(0, 0, 1, 0, 1, 1, 0, 1);
+        indices.push(
+          vertexCount, vertexCount + 1, vertexCount + 2,
+          vertexCount, vertexCount + 2, vertexCount + 3
+        );
+        vertexCount += 4;
+        faceCount++;
+      };
+
+      // +Y Top
+      emitFace([x0, y1, z1], [x1, y1, z1], [x1, y1, z0], [x0, y1, z0], [0, 1, 0], rTop, 1.0);
+      // -Y Bottom
+      emitFace([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], [0, -1, 0], rBot, 0.62);
+      // +Z South
+      emitFace([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1], [0, 0, 1], rSouth, 0.88);
+      // -Z North
+      emitFace([x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0], [0, 0, -1], rNorth, 0.86);
+      // +X East
+      emitFace([x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1], [1, 0, 0], rEast, 0.80);
+      // -X West
+      emitFace([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0], [-1, 0, 0], rWest, 0.78);
+    };
+
+    const getRect = (key) => tileRects[key] || fallbackRect;
+    const isFenceConnectable = (nx, ny, nz) => {
+      const nid = getBlockAtLocal(nx, ny, nz);
+      if (nid === BLOCK_IDS.AIR) return false;
+      const ndef = blockTable[nid];
+      return Boolean(ndef && (ndef.renderShape === 'fence' || ndef.occludesFaces));
+    };
+
+    for (let y = yMin; y < yMax; y++) {
       for (let lz = 0; lz < CHUNK_DEPTH; lz++) {
         for (let lx = 0; lx < CHUNK_WIDTH; lx++) {
           const blockId = getBlockAtLocal(lx, y, lz);
           if (blockId === BLOCK_IDS.AIR) continue;
           const def = blockTable[blockId];
-          if (!def || !def.crossPlant) continue;
+          if (!def) continue;
+
+          const shape = def.renderShape || 'cube';
+          if (shape !== 'cube' && shape !== 'half' && shape !== 'portal' && shape !== 'end_portal') {
+            const selfLight = getLightAtLocal(lx, y, lz);
+            const skyNorm = selfLight.sky / 15;
+            const blockNorm = Math.max(selfLight.block, def.lightEmission || 0) / 15;
+            const rTop = getRect(def.textures?.top || def.textures?.north || 'stone');
+            const rBot = getRect(def.textures?.bottom || def.textures?.top || 'stone');
+            const rSide = getRect(def.textures?.north || def.textures?.east || def.textures?.top || 'stone');
+            const defaultRects = { top: rTop, bottom: rBot, side: rSide };
+
+            if (shape === 'door_open') {
+              const xEdge = lx + 0.08;
+              emitQuad(
+                [xEdge, y, lz],
+                [xEdge, y, lz + 1],
+                [xEdge, y + 1, lz + 1],
+                [xEdge, y + 1, lz],
+                [1, 0, 0],
+                rSide,
+                skyNorm,
+                blockNorm,
+                true
+              );
+            } else if (shape === 'slab') {
+              emitBox(lx, y, lz, lx + 1, y + 0.5, lz + 1, defaultRects, skyNorm, blockNorm);
+            } else if (shape === 'stairs') {
+              emitBox(lx, y, lz, lx + 1, y + 0.5, lz + 1, defaultRects, skyNorm, blockNorm);
+              emitBox(lx, y + 0.5, lz + 0.5, lx + 1, y + 1, lz + 1, defaultRects, skyNorm, blockNorm);
+            } else if (shape === 'fence') {
+              emitBox(lx + 0.375, y, lz + 0.375, lx + 0.625, y + 1, lz + 0.625, defaultRects, skyNorm, blockNorm);
+              if (isFenceConnectable(lx + 1, y, lz)) {
+                emitBox(lx + 0.625, y + 0.72, lz + 0.43, lx + 1, y + 0.90, lz + 0.57, defaultRects, skyNorm, blockNorm);
+                emitBox(lx + 0.625, y + 0.32, lz + 0.43, lx + 1, y + 0.50, lz + 0.57, defaultRects, skyNorm, blockNorm);
+              }
+              if (isFenceConnectable(lx - 1, y, lz)) {
+                emitBox(lx, y + 0.72, lz + 0.43, lx + 0.375, y + 0.90, lz + 0.57, defaultRects, skyNorm, blockNorm);
+                emitBox(lx, y + 0.32, lz + 0.43, lx + 0.375, y + 0.50, lz + 0.57, defaultRects, skyNorm, blockNorm);
+              }
+              if (isFenceConnectable(lx, y, lz + 1)) {
+                emitBox(lx + 0.43, y + 0.72, lz + 0.625, lx + 0.57, y + 0.90, lz + 1, defaultRects, skyNorm, blockNorm);
+                emitBox(lx + 0.43, y + 0.32, lz + 0.625, lx + 0.57, y + 0.50, lz + 1, defaultRects, skyNorm, blockNorm);
+              }
+              if (isFenceConnectable(lx, y, lz - 1)) {
+                emitBox(lx + 0.43, y + 0.72, lz, lx + 0.57, y + 0.90, lz + 0.375, defaultRects, skyNorm, blockNorm);
+                emitBox(lx + 0.43, y + 0.32, lz, lx + 0.57, y + 0.50, lz + 0.375, defaultRects, skyNorm, blockNorm);
+              }
+            } else if (shape === 'lantern') {
+              emitBox(lx + 0.31, y, lz + 0.31, lx + 0.69, y + 0.48, lz + 0.69, defaultRects, skyNorm, blockNorm);
+              emitBox(lx + 0.38, y + 0.48, lz + 0.38, lx + 0.62, y + 0.60, lz + 0.62, { all: rTop }, skyNorm, blockNorm);
+              emitBox(lx + 0.46, y + 0.60, lz + 0.46, lx + 0.54, y + 0.82, lz + 0.54, { all: rTop }, skyNorm, blockNorm);
+            } else if (shape === 'campfire') {
+              const logRect = { all: getRect('campfire_log') };
+              emitBox(lx + 0.05, y, lz + 0.12, lx + 0.95, y + 0.25, lz + 0.38, logRect, skyNorm, blockNorm);
+              emitBox(lx + 0.05, y, lz + 0.62, lx + 0.95, y + 0.25, lz + 0.88, logRect, skyNorm, blockNorm);
+              emitBox(lx + 0.12, y + 0.16, lz + 0.05, lx + 0.38, y + 0.38, lz + 0.95, logRect, skyNorm, blockNorm);
+              emitBox(lx + 0.62, y + 0.16, lz + 0.05, lx + 0.88, y + 0.38, lz + 0.95, logRect, skyNorm, blockNorm);
+              const fireRect = getRect('campfire_fire');
+              emitQuad([lx + 0.18, y + 0.22, lz + 0.18], [lx + 0.82, y + 0.22, lz + 0.82], [lx + 0.82, y + 0.98, lz + 0.82], [lx + 0.18, y + 0.98, lz + 0.18], [-INV_SQRT2, 0, INV_SQRT2], fireRect, skyNorm, 1.0, true);
+              emitQuad([lx + 0.82, y + 0.22, lz + 0.18], [lx + 0.18, y + 0.22, lz + 0.82], [lx + 0.18, y + 0.98, lz + 0.82], [lx + 0.82, y + 0.98, lz + 0.18], [-INV_SQRT2, 0, -INV_SQRT2], fireRect, skyNorm, 1.0, true);
+            } else if (shape === 'redstone_dust') {
+              emitBox(lx + 0.06, y, lz + 0.06, lx + 0.94, y + 0.06, lz + 0.94, defaultRects, skyNorm, blockNorm);
+            } else if (shape === 'pressure_plate' || shape === 'pressure_plate_on') {
+              const topH = shape === 'pressure_plate_on' ? 0.04 : 0.09;
+              emitBox(lx + 0.06, y, lz + 0.06, lx + 0.94, y + topH, lz + 0.94, defaultRects, skyNorm, blockNorm);
+            } else if (shape === 'button' || shape === 'button_on') {
+              const topH = shape === 'button_on' ? 0.07 : 0.14;
+              emitBox(lx + 0.32, y, lz + 0.38, lx + 0.68, y + topH, lz + 0.62, defaultRects, skyNorm, blockNorm);
+            } else if (shape === 'lever' || shape === 'lever_on') {
+              emitBox(lx + 0.30, y, lz + 0.25, lx + 0.70, y + 0.18, lz + 0.75, { all: getRect('cobblestone') }, skyNorm, blockNorm);
+              const tipZ = shape === 'lever_on' ? 0.62 : 0.30;
+              emitBox(lx + 0.44, y + 0.16, lz + tipZ, lx + 0.56, y + 0.66, lz + tipZ + 0.12, { all: rTop }, skyNorm, blockNorm);
+            } else if (shape === 'sign') {
+              const woodRect = { all: getRect('planks_oak') };
+              emitBox(lx + 0.44, y, lz + 0.44, lx + 0.56, y + 0.56, lz + 0.56, woodRect, skyNorm, blockNorm);
+              emitBox(lx + 0.06, y + 0.52, lz + 0.43, lx + 0.94, y + 0.98, lz + 0.57, { all: getRect('oak_sign') }, skyNorm, blockNorm);
+            } else if (shape === 'enchanting_table') {
+              emitBox(lx, y, lz, lx + 1, y + 0.75, lz + 1, defaultRects, skyNorm, blockNorm);
+              emitBox(lx + 0.32, y + 0.86, lz + 0.36, lx + 0.68, y + 0.96, lz + 0.64, { all: getRect('bookshelf') }, skyNorm, Math.max(blockNorm, 0.7));
+            } else if (shape === 'anvil') {
+              emitBox(lx + 0.12, y, lz + 0.12, lx + 0.88, y + 0.25, lz + 0.88, defaultRects, skyNorm, blockNorm);
+              emitBox(lx + 0.28, y + 0.25, lz + 0.22, lx + 0.72, y + 0.62, lz + 0.78, defaultRects, skyNorm, blockNorm);
+              emitBox(lx + 0.18, y + 0.62, lz + 0.04, lx + 0.82, y + 1.0, lz + 0.96, defaultRects, skyNorm, blockNorm);
+            } else if (shape === 'brewing_stand') {
+              emitBox(lx + 0.12, y, lz + 0.12, lx + 0.88, y + 0.14, lz + 0.88, { all: getRect('cobblestone') }, skyNorm, blockNorm);
+              emitBox(lx + 0.44, y + 0.14, lz + 0.44, lx + 0.56, y + 0.92, lz + 0.56, { all: getRect('brewing_stand') }, skyNorm, blockNorm);
+              emitBox(lx + 0.20, y + 0.52, lz + 0.46, lx + 0.80, y + 0.62, lz + 0.54, { all: getRect('brewing_stand') }, skyNorm, blockNorm);
+              emitBox(lx + 0.46, y + 0.52, lz + 0.20, lx + 0.54, y + 0.62, lz + 0.80, { all: getRect('brewing_stand') }, skyNorm, blockNorm);
+            } else if (shape === 'end_portal_frame' || shape === 'end_portal_frame_filled') {
+              emitBox(lx, y, lz, lx + 1, y + 0.8125, lz + 1, defaultRects, skyNorm, blockNorm);
+              if (shape === 'end_portal_frame_filled') {
+                emitBox(lx + 0.26, y + 0.8125, lz + 0.26, lx + 0.74, y + 1.0, lz + 0.74, { all: getRect('end_portal_frame_top_filled') }, skyNorm, 1.0);
+              }
+            } else if (shape === 'dragon_egg') {
+              emitBox(lx + 0.16, y, lz + 0.16, lx + 0.84, y + 0.55, lz + 0.84, defaultRects, skyNorm, blockNorm);
+              emitBox(lx + 0.26, y + 0.55, lz + 0.26, lx + 0.74, y + 0.85, lz + 0.74, defaultRects, skyNorm, blockNorm);
+              emitBox(lx + 0.36, y + 0.85, lz + 0.36, lx + 0.64, y + 1.0, lz + 0.64, defaultRects, skyNorm, blockNorm);
+            } else if (shape === 'piston_extended') {
+              emitBox(lx, y, lz + 0.25, lx + 1, y + 1, lz + 1, defaultRects, skyNorm, blockNorm);
+              emitBox(lx + 0.36, y + 0.36, lz - 0.55, lx + 0.64, y + 0.64, lz + 0.25, { all: getRect('planks_oak') }, skyNorm, blockNorm);
+              emitBox(lx, y, lz - 0.80, lx + 1, y + 1, lz - 0.55, { all: getRect('piston_head') }, skyNorm, blockNorm);
+            }
+            continue;
+          }
+
+          if (!def.crossPlant) continue;
 
           const tileKey = def.textures?.north || def.textures?.top || 'tall_grass';
           const rect = tileRects[tileKey] || fallbackRect;

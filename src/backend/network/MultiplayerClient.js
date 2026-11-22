@@ -5,6 +5,7 @@
  */
 
 import * as THREE from 'three';
+import { PlayerAvatar } from '../../game/PlayerAvatar.js';
 import { ENGINE_EVENTS } from '../core/EventBus.js';
 import {
   MP_MESSAGES,
@@ -57,8 +58,20 @@ export class MultiplayerClient {
     this._reconnectTimer = null;
     /** @type {boolean} */
     this._manualDisconnect = false;
+    /** @type {number} */
+    this._reconnectAttempts = 0;
+    /** @type {number} */
+    this._maxReconnectAttempts = 3;
 
     this._bindLocalWorldEdits();
+  }
+
+  /**
+   * Convenience boolean getter indicating whether the room WebSocket is connected.
+   * @returns {boolean}
+   */
+  get connected() {
+    return this.status === 'connected';
   }
 
   /**
@@ -90,14 +103,19 @@ export class MultiplayerClient {
   attachScene(scene) {
     if (this.scene) {
       for (const peer of this.remotePlayers.values()) {
-        if (peer.mesh) this.scene.remove(peer.mesh);
+        if (peer.avatar?.root) this.scene.remove(peer.avatar.root);
       }
     }
     this.scene = scene;
     if (this.scene) {
       for (const peer of this.remotePlayers.values()) {
-        if (!peer.mesh) peer.mesh = this._buildAvatarMesh(peer.color);
-        this.scene.add(peer.mesh);
+        if (!peer.avatar) {
+          peer.avatar = new PlayerAvatar({ shirtColor: peer.color, name: peer.name });
+          peer.avatar.setArmor(peer.armorIds);
+          peer.avatar.setHeldItem(peer.heldItemId, this.worldManager.itemRegistry);
+          peer.mesh = peer.avatar.root;
+        }
+        this.scene.add(peer.avatar.root);
       }
     }
   }
@@ -125,9 +143,13 @@ export class MultiplayerClient {
     playerName = this.playerName,
     url = MultiplayerClient.getDefaultWebSocketUrl(),
     WebSocketImpl = undefined,
+    isReconnect = false,
   } = {}) {
     this.disconnect();
     this._manualDisconnect = false;
+    if (!isReconnect) {
+      this._reconnectAttempts = 0;
+    }
     this.roomId = normalizeRoomId(roomId);
     this.playerName = normalizePlayerName(playerName);
     this.serverUrl = url;
@@ -144,6 +166,7 @@ export class MultiplayerClient {
 
     const handleOpen = () => {
       if (this.socket !== socket) return;
+      this._reconnectAttempts = 0;
       const pos = this.worldManager.player.getPosition();
       const rot = this.worldManager.player.getRotation();
       socket.send(
@@ -167,6 +190,11 @@ export class MultiplayerClient {
       if (msg) this._handlePacket(msg);
     };
 
+    const handleError = () => {
+      // Handled gracefully alongside close event to prevent unhandled socket errors
+      if (this.socket !== socket) return;
+    };
+
     const handleClose = () => {
       if (this.socket !== socket) return;
       this.status = 'disconnected';
@@ -176,7 +204,13 @@ export class MultiplayerClient {
         roomId: this.roomId,
       });
 
-      if (!this._manualDisconnect && typeof setTimeout !== 'undefined') {
+      if (
+        !this._manualDisconnect &&
+        this._reconnectAttempts < this._maxReconnectAttempts &&
+        typeof setTimeout !== 'undefined'
+      ) {
+        this._reconnectAttempts += 1;
+        const delayMs = 2500 * this._reconnectAttempts;
         this._reconnectTimer = /** @type {any} */ (
           setTimeout(() => {
             if (!this._manualDisconnect && this.serverUrl) {
@@ -185,9 +219,10 @@ export class MultiplayerClient {
                 playerName: this.playerName,
                 url: this.serverUrl,
                 WebSocketImpl,
+                isReconnect: true,
               });
             }
-          }, 2500)
+          }, delayMs)
         );
       }
     };
@@ -195,10 +230,12 @@ export class MultiplayerClient {
     if (typeof socket.addEventListener === 'function') {
       socket.addEventListener('open', handleOpen);
       socket.addEventListener('message', handleMessage);
+      socket.addEventListener('error', handleError);
       socket.addEventListener('close', handleClose);
     } else {
       socket.onopen = handleOpen;
       socket.onmessage = handleMessage;
+      socket.onerror = handleError;
       socket.onclose = handleClose;
     }
   }
@@ -259,13 +296,21 @@ export class MultiplayerClient {
   update(deltaTime) {
     const dt = Math.min(Math.max(deltaTime, 0), 0.1);
 
-    // 1. Broadcast local pose at ~18Hz when changed
+    // 1. Broadcast local pose & avatar state at ~18Hz when changed
     if (this.status === 'connected' && this.socket?.readyState === 1) {
       this._moveSendTimer += dt;
       if (this._moveSendTimer >= 0.055) {
         this._moveSendTimer = 0;
         const pos = this.worldManager.player.getPosition();
         const rot = this.worldManager.player.getRotation();
+        const sneaking = Boolean(this.worldManager.player.inputState?.sneak);
+        const shielding = Boolean(this.worldManager.survival?.shieldBlocking);
+        const heldItemId = this.worldManager.inventory?.getSelectedStack()?.itemId ?? null;
+        const armorIds = this.worldManager.inventory?.getArmorIds?.() ?? null;
+        const ridingBoat = Boolean(this.worldManager.entities?.getMountedBoat?.());
+        const armorSig = armorIds
+          ? `${armorIds.helmet || ''}|${armorIds.chestplate || ''}|${armorIds.leggings || ''}|${armorIds.boots || ''}`
+          : '';
         const last = this._lastSentPose;
         const moved =
           !last ||
@@ -273,9 +318,22 @@ export class MultiplayerClient {
           Math.abs(pos.y - last.y) > 0.015 ||
           Math.abs(pos.z - last.z) > 0.015 ||
           Math.abs(rot.yaw - last.yaw) > 0.015 ||
-          Math.abs(rot.pitch - last.pitch) > 0.015;
+          Math.abs(rot.pitch - last.pitch) > 0.015 ||
+          last.sneaking !== sneaking ||
+          last.shielding !== shielding ||
+          last.heldItemId !== heldItemId ||
+          last.armorSig !== armorSig ||
+          last.ridingBoat !== ridingBoat;
         if (moved) {
-          this._lastSentPose = { ...pos, ...rot };
+          this._lastSentPose = {
+            ...pos,
+            ...rot,
+            sneaking,
+            shielding,
+            heldItemId,
+            armorSig,
+            ridingBoat,
+          };
           this.socket.send(
             encodePacket(MP_MESSAGES.PLAYER_MOVE, {
               x: Number(pos.x.toFixed(3)),
@@ -283,13 +341,18 @@ export class MultiplayerClient {
               z: Number(pos.z.toFixed(3)),
               yaw: Number(rot.yaw.toFixed(3)),
               pitch: Number(rot.pitch.toFixed(3)),
+              sneaking,
+              shielding,
+              heldItemId,
+              armorIds,
+              ridingBoat,
             })
           );
         }
       }
     }
 
-    // 2. Smoothly interpolate remote avatars and animate walking gait
+    // 2. Smoothly interpolate remote articulated PlayerAvatars
     const blend = Math.min(1, dt * 14);
     for (const peer of this.remotePlayers.values()) {
       const dx = peer.targetX - peer.x;
@@ -301,21 +364,26 @@ export class MultiplayerClient {
       peer.y += dy * blend;
       peer.z += dz * blend;
       peer.yaw += (peer.targetYaw - peer.yaw) * blend;
+      peer.pitch += ((peer.targetPitch ?? 0) - (peer.pitch ?? 0)) * blend;
 
-      if (stepDist > 0.015) {
-        peer.walkPhase += stepDist * 4.5 * blend;
-      }
+      const approxSpeed = dt > 0 ? (stepDist * blend) / dt : 0;
 
-      if (peer.mesh) {
-        peer.mesh.position.set(peer.x, peer.y, peer.z);
-        peer.mesh.rotation.y = peer.yaw;
-        const swing = Math.sin(peer.walkPhase) * 0.45;
-        if (peer.limbs.length >= 4) {
-          peer.limbs[0].rotation.x = swing;
-          peer.limbs[1].rotation.x = -swing;
-          peer.limbs[2].rotation.x = -swing;
-          peer.limbs[3].rotation.x = swing;
-        }
+      if (peer.avatar) {
+        peer.avatar.setArmor(peer.armorIds);
+        peer.avatar.setHeldItem(peer.heldItemId, this.worldManager.itemRegistry);
+        peer.avatar.update(dt, {
+          x: peer.x,
+          y: peer.y,
+          z: peer.z,
+          yaw: peer.yaw,
+          pitch: peer.pitch,
+          speed: approxSpeed,
+          sneaking: Boolean(peer.sneaking),
+          swinging: Boolean(peer.swinging),
+          shielding: Boolean(peer.shielding),
+          hasShield: Boolean(peer.shielding || peer.heldItemId === 'shield'),
+          ridingBoat: Boolean(peer.ridingBoat),
+        });
       }
     }
   }
@@ -390,8 +458,8 @@ export class MultiplayerClient {
         if (msg.id) {
           const peer = this.remotePlayers.get(msg.id);
           if (peer) {
-            if (this.scene && peer.mesh) this.scene.remove(peer.mesh);
-            this._disposeAvatarMesh(peer.mesh);
+            if (this.scene && peer.avatar?.root) this.scene.remove(peer.avatar.root);
+            peer.avatar?.dispose();
             this.remotePlayers.delete(msg.id);
             this.worldManager.bus.emit(ENGINE_EVENTS.MP_PLAYER_LEFT, { id: msg.id, name: peer.name });
           }
@@ -406,6 +474,13 @@ export class MultiplayerClient {
           peer.targetY = msg.y;
           peer.targetZ = msg.z;
           peer.targetYaw = msg.yaw;
+          peer.targetPitch = Number.isFinite(msg.pitch) ? msg.pitch : 0;
+          peer.sneaking = Boolean(msg.sneaking);
+          peer.swinging = Boolean(msg.swinging);
+          peer.shielding = Boolean(msg.shielding);
+          if (msg.heldItemId !== undefined) peer.heldItemId = msg.heldItemId;
+          if (msg.armorIds !== undefined) peer.armorIds = msg.armorIds;
+          peer.ridingBoat = Boolean(msg.ridingBoat);
         }
         break;
       }
@@ -454,15 +529,19 @@ export class MultiplayerClient {
       existing.targetY = p.y;
       existing.targetZ = p.z;
       existing.targetYaw = p.yaw ?? 0;
+      existing.targetPitch = p.pitch ?? 0;
       return;
     }
 
-    const mesh = this.scene ? this._buildAvatarMesh(p.color ?? 0x38bdf8) : null;
-    const limbs = mesh?.userData?.limbs ?? [];
-    if (mesh) {
-      mesh.position.set(p.x, p.y, p.z);
-      mesh.rotation.y = p.yaw ?? 0;
-      this.scene.add(mesh);
+    const avatar = this.scene
+      ? new PlayerAvatar({ shirtColor: p.color ?? 0x38bdf8, name: p.name ?? 'Player' })
+      : null;
+    if (avatar && this.scene) {
+      avatar.setArmor(p.armorIds ?? null);
+      avatar.setHeldItem(p.heldItemId ?? null, this.worldManager.itemRegistry);
+      avatar.root.position.set(p.x, p.y, p.z);
+      avatar.root.rotation.y = p.yaw ?? 0;
+      this.scene.add(avatar.root);
     }
 
     this.remotePlayers.set(p.id, {
@@ -478,66 +557,23 @@ export class MultiplayerClient {
       targetY: p.y,
       targetZ: p.z,
       targetYaw: p.yaw ?? 0,
-      mesh,
-      walkPhase: 0,
-      limbs,
-    });
-  }
-
-  /** @private */
-  _buildAvatarMesh(shirtColorHex) {
-    const group = new THREE.Group();
-    const limbs = [];
-
-    const addPart = (w, h, d, color, x, y, z) => {
-      const geo = new THREE.BoxGeometry(w, h, d);
-      const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.8 });
-      const m = new THREE.Mesh(geo, mat);
-      m.position.set(x, y, z);
-      m.castShadow = true;
-      m.receiveShadow = true;
-      group.add(m);
-      return m;
-    };
-
-    // Head + eyes facing -Z
-    addPart(0.44, 0.44, 0.44, 0xe0b28c, 0, 1.56, 0);
-    addPart(0.46, 0.14, 0.46, 0x3f2a1d, 0, 1.74, 0);
-    addPart(0.08, 0.06, 0.04, 0x1e293b, -0.1, 1.58, -0.22);
-    addPart(0.08, 0.06, 0.04, 0x1e293b, 0.1, 1.58, -0.22);
-
-    // Torso
-    addPart(0.48, 0.66, 0.24, shirtColorHex, 0, 1.0, 0);
-
-    // Arms & Legs
-    const leftArm = addPart(0.18, 0.64, 0.2, shirtColorHex, -0.34, 1.0, 0);
-    const rightArm = addPart(0.18, 0.64, 0.2, shirtColorHex, 0.34, 1.0, 0);
-    const leftLeg = addPart(0.2, 0.66, 0.22, 0x263259, -0.12, 0.33, 0);
-    const rightLeg = addPart(0.2, 0.66, 0.22, 0x263259, 0.12, 0.33, 0);
-    limbs.push(leftArm, rightArm, leftLeg, rightLeg);
-
-    group.userData.limbs = limbs;
-    return group;
-  }
-
-  /** @private */
-  _disposeAvatarMesh(mesh) {
-    if (!mesh) return;
-    mesh.traverse((child) => {
-      if (/** @type {any} */ (child).geometry) {
-        /** @type {any} */ (child).geometry.dispose();
-      }
-      if (/** @type {any} */ (child).material) {
-        /** @type {any} */ (child).material.dispose();
-      }
+      targetPitch: p.pitch ?? 0,
+      sneaking: Boolean(p.sneaking),
+      swinging: Boolean(p.swinging),
+      shielding: Boolean(p.shielding),
+      heldItemId: p.heldItemId ?? null,
+      armorIds: p.armorIds ?? null,
+      ridingBoat: Boolean(p.ridingBoat),
+      avatar,
+      mesh: avatar?.root ?? null,
     });
   }
 
   /** @private */
   _clearRemotePlayers() {
     for (const peer of this.remotePlayers.values()) {
-      if (this.scene && peer.mesh) this.scene.remove(peer.mesh);
-      this._disposeAvatarMesh(peer.mesh);
+      if (this.scene && peer.avatar?.root) this.scene.remove(peer.avatar.root);
+      peer.avatar?.dispose();
     }
     this.remotePlayers.clear();
   }

@@ -26,6 +26,12 @@ interface RoomPlayer {
   z: number;
   yaw: number;
   pitch: number;
+  sneaking?: boolean;
+  swinging?: boolean;
+  shielding?: boolean;
+  heldItemId?: string | null;
+  armorIds?: Record<string, string | null> | null;
+  ridingBoat?: boolean;
 }
 
 interface BlockDelta {
@@ -171,6 +177,12 @@ export function attachMultiplayerServer(server: http.Server): {
           entry.info.z = msg.z;
           entry.info.yaw = Number.isFinite(msg.yaw) ? msg.yaw : entry.info.yaw;
           entry.info.pitch = Number.isFinite(msg.pitch) ? msg.pitch : entry.info.pitch;
+          if (typeof msg.sneaking === 'boolean') entry.info.sneaking = msg.sneaking;
+          if (typeof msg.swinging === 'boolean') entry.info.swinging = msg.swinging;
+          if (typeof msg.shielding === 'boolean') entry.info.shielding = msg.shielding;
+          if (msg.heldItemId !== undefined) entry.info.heldItemId = msg.heldItemId;
+          if (msg.armorIds !== undefined) entry.info.armorIds = msg.armorIds;
+          if (typeof msg.ridingBoat === 'boolean') entry.info.ridingBoat = msg.ridingBoat;
 
           broadcastToRoom(
             activeRoom,
@@ -181,6 +193,12 @@ export function attachMultiplayerServer(server: http.Server): {
               z: entry.info.z,
               yaw: entry.info.yaw,
               pitch: entry.info.pitch,
+              sneaking: Boolean(entry.info.sneaking),
+              swinging: Boolean(entry.info.swinging),
+              shielding: Boolean(entry.info.shielding),
+              heldItemId: entry.info.heldItemId ?? null,
+              armorIds: entry.info.armorIds ?? null,
+              ridingBoat: Boolean(entry.info.ridingBoat),
             }),
             clientId
           );

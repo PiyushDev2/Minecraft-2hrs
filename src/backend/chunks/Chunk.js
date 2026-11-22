@@ -17,6 +17,11 @@ import {
 
 export { CHUNK_WIDTH, CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_VOLUME, getChunkKey };
 
+export const SECTION_HEIGHT = 16;
+export const CHUNK_SECTIONS = CHUNK_HEIGHT / SECTION_HEIGHT; // 8 vertical 16x16x16 sub-chunks
+
+const isLiquidBlock = (id) => id === BLOCK_IDS.WATER || id === BLOCK_IDS.LAVA;
+
 /**
  * A single 16x128x16 chunk of voxel data and its associated Three.js mesh group.
  */
@@ -70,6 +75,10 @@ export class Chunk {
     this.lightDirty = true;
     /** @type {boolean} */
     this.dirty = false;
+    /** @type {number} 8-bit bitmask of dirty 16x16x16 vertical sub-chunk sections */
+    this.dirtySectionsMask = 0xff;
+    /** @type {boolean} True when chunk uses per-section sub-chunk meshes instead of monolithic worker mesh */
+    this.usingSectionMeshes = false;
     /** @type {number} Monotonic counter incremented on block or light mutations to reject stale worker meshes. */
     this.editVersion = 0;
 
@@ -79,6 +88,10 @@ export class Chunk {
     this.opaqueMesh = null;
     /** @type {THREE.Mesh|null} */
     this.waterMesh = null;
+    /** @type {Array<THREE.Mesh|null>} */
+    this.opaqueSections = new Array(CHUNK_SECTIONS).fill(null);
+    /** @type {Array<THREE.Mesh|null>} */
+    this.waterSections = new Array(CHUNK_SECTIONS).fill(null);
 
     /**
      * World-space bounding box of this chunk for frustum culling and queries.
@@ -168,7 +181,7 @@ export class Chunk {
       return false;
     }
     this.blocks[idx] = blockId;
-    if (blockId !== BLOCK_IDS.WATER) {
+    if (!isLiquidBlock(blockId)) {
       this.fluidData[idx] = 0;
     }
     if (recordModification) {
@@ -177,9 +190,31 @@ export class Chunk {
     if (prev !== blockId) {
       this.dirty = true;
       this.lightDirty = true;
+      this.markSectionDirty(y);
       this.editVersion++;
     }
     return prev !== blockId;
+  }
+
+  /**
+   * Marks the 16x16x16 vertical sub-chunk containing world/local Y dirty (plus adjacent section on boundaries).
+   * @param {number} y
+   */
+  markSectionDirty(y) {
+    if (y < 0 || y >= CHUNK_HEIGHT) return;
+    const sec = y >> 4;
+    this.dirtySectionsMask |= 1 << sec;
+    const rem = y & 15;
+    if (rem === 0 && sec > 0) this.dirtySectionsMask |= 1 << (sec - 1);
+    if (rem === 15 && sec < CHUNK_SECTIONS - 1) this.dirtySectionsMask |= 1 << (sec + 1);
+  }
+
+  /**
+   * Marks all 8 vertical sub-chunk sections dirty.
+   */
+  markAllSectionsDirty() {
+    this.dirty = true;
+    this.dirtySectionsMask = 0xff;
   }
 
   /**
@@ -209,6 +244,7 @@ export class Chunk {
     if (this.fluidData[idx] === next) return false;
     this.fluidData[idx] = next;
     this.dirty = true;
+    this.markSectionDirty(y);
     this.editVersion++;
     return true;
   }
@@ -287,12 +323,13 @@ export class Chunk {
       const [idx, blockId, fluidMeta = 0] = entries[i];
       if (idx >= 0 && idx < CHUNK_VOLUME) {
         this.blocks[idx] = blockId;
-        this.fluidData[idx] = blockId === BLOCK_IDS.WATER ? fluidMeta & 0xff : 0;
+        this.fluidData[idx] = isLiquidBlock(blockId) ? fluidMeta & 0xff : 0;
         this.modifications.set(idx, blockId);
       }
     }
     if (entries.length > 0) {
       this.dirty = true;
+      this.dirtySectionsMask = 0xff;
       this.lightDirty = true;
       this.editVersion++;
     }
@@ -305,7 +342,7 @@ export class Chunk {
   exportModifications() {
     const out = [];
     for (const [idx, blockId] of this.modifications.entries()) {
-      const fMeta = blockId === BLOCK_IDS.WATER ? this.fluidData[idx] : 0;
+      const fMeta = isLiquidBlock(blockId) ? this.fluidData[idx] : 0;
       out.push(fMeta !== 0 ? [idx, blockId, fMeta] : [idx, blockId]);
     }
     return out;
@@ -332,6 +369,25 @@ export class Chunk {
   }
 
   /**
+   * Disposes GPU geometries for a single 16x16x16 vertical section.
+   * @param {number} secY 0..7
+   */
+  disposeSectionMesh(secY) {
+    const om = this.opaqueSections[secY];
+    if (om) {
+      om.geometry?.dispose();
+      this.meshGroup?.remove(om);
+      this.opaqueSections[secY] = null;
+    }
+    const wm = this.waterSections[secY];
+    if (wm) {
+      wm.geometry?.dispose();
+      this.meshGroup?.remove(wm);
+      this.waterSections[secY] = null;
+    }
+  }
+
+  /**
    * Releases GPU geometries attached to this chunk to avoid WebGL memory leaks.
    * @param {boolean} [keepGroup=false] - Preserve meshGroup container during remeshing.
    */
@@ -346,6 +402,10 @@ export class Chunk {
       this.meshGroup?.remove(this.waterMesh);
       this.waterMesh = null;
     }
+    for (let s = 0; s < CHUNK_SECTIONS; s++) {
+      this.disposeSectionMesh(s);
+    }
+    this.usingSectionMeshes = false;
     if (!keepGroup && this.meshGroup) {
       this.meshGroup.clear();
       this.meshGroup = null;

@@ -4,7 +4,7 @@
  * air drag, jumping, water buoyancy, and voxel collision stepping.
  */
 
-import { AABB, isBoxInLiquid, moveBoxWithCollision } from './Collision.js';
+import { AABB, isBoxInLava, isBoxInWater, moveBoxWithCollision } from './Collision.js';
 
 export const PHYSICS_CONSTANTS = Object.freeze({
   GRAVITY: -28.0,
@@ -57,7 +57,16 @@ function _integrateSubstep(entity, world, dt, intent) {
   const vel = entity.velocity;
   const box = AABB.fromEntityPosition(pos.x, pos.y, pos.z, entity.width, entity.height);
 
-  entity.inWater = isBoxInLiquid(world, box);
+  entity.inWater = isBoxInWater(world, box);
+  entity.inLava = isBoxInLava(world, box);
+  const footX = Math.floor(pos.x);
+  const footY = Math.floor(pos.y + 0.15);
+  const midY = Math.floor(pos.y + entity.height * 0.5);
+  const footZ = Math.floor(pos.z);
+  const bFoot = world.getBlock(footX, footY, footZ);
+  const bMid = world.getBlock(footX, midY, footZ);
+  entity.onLadder =
+    world.blockRegistry.isClimbable(bFoot) || world.blockRegistry.isClimbable(bMid);
 
   if (entity.flyMode) {
     const speed = intent.sprint ? PHYSICS_CONSTANTS.FLY_SPRINT_SPEED : PHYSICS_CONSTANTS.FLY_SPEED;
@@ -80,22 +89,27 @@ function _integrateSubstep(entity, world, dt, intent) {
   } else {
     // Horizontal movement
     let maxSpeed = PHYSICS_CONSTANTS.WALK_SPEED;
-    if (entity.inWater) {
+    if (entity.inLava) {
+      maxSpeed = PHYSICS_CONSTANTS.WALK_SPEED * 0.4;
+    } else if (entity.inWater) {
       maxSpeed = PHYSICS_CONSTANTS.SWIM_SPEED;
+    } else if (entity.onLadder) {
+      maxSpeed = PHYSICS_CONSTANTS.SNEAK_SPEED * 1.15;
     } else if (intent.sneak) {
       maxSpeed = PHYSICS_CONSTANTS.SNEAK_SPEED;
     } else if (intent.sprint) {
       maxSpeed = PHYSICS_CONSTANTS.SPRINT_SPEED;
     }
 
-    const accel = entity.grounded ? PHYSICS_CONSTANTS.GROUND_ACCEL : PHYSICS_CONSTANTS.AIR_ACCEL;
-    const friction = entity.inWater
+    const accel = entity.grounded || entity.onLadder ? PHYSICS_CONSTANTS.GROUND_ACCEL : PHYSICS_CONSTANTS.AIR_ACCEL;
+    const friction = entity.inLava
+      ? PHYSICS_CONSTANTS.WATER_FRICTION * 1.6
+      : entity.inWater
       ? PHYSICS_CONSTANTS.WATER_FRICTION
-      : entity.grounded
+      : entity.grounded || entity.onLadder
       ? PHYSICS_CONSTANTS.GROUND_FRICTION
       : PHYSICS_CONSTANTS.AIR_FRICTION;
 
-    // Apply damping when no horizontal input, or accelerate toward wish direction
     const wishMag = Math.hypot(intent.wishX, intent.wishZ);
     if (wishMag > 0.001) {
       const targetVx = (intent.wishX / wishMag) * maxSpeed;
@@ -109,8 +123,22 @@ function _integrateSubstep(entity, world, dt, intent) {
       vel.z *= damp;
     }
 
-    // Vertical forces: gravity, jump, water buoyancy
-    if (entity.inWater) {
+    // Vertical forces: ladder climbing, lava viscosity, water buoyancy, or gravity/jump
+    if (entity.onLadder) {
+      if (intent.jump || wishMag > 0.1) {
+        vel.y = 4.2;
+      } else if (intent.sneak) {
+        vel.y = 0;
+      } else {
+        vel.y = -2.0;
+      }
+    } else if (entity.inLava) {
+      vel.y += PHYSICS_CONSTANTS.WATER_GRAVITY * 0.85 * dt;
+      if (intent.jump) {
+        vel.y = Math.min(PHYSICS_CONSTANTS.SWIM_UP_VELOCITY * 0.55, vel.y + 14.0 * dt);
+      }
+      vel.y = Math.max(-2.6, vel.y);
+    } else if (entity.inWater) {
       vel.y += PHYSICS_CONSTANTS.WATER_GRAVITY * dt;
       if (intent.jump) {
         vel.y = Math.min(PHYSICS_CONSTANTS.SWIM_UP_VELOCITY, vel.y + 24.0 * dt);

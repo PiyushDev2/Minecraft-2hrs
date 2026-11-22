@@ -6,11 +6,11 @@
 
 import * as THREE from 'three';
 import { BLOCK_IDS } from '../blocks/BlockRegistry.js';
-import { CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_WIDTH } from './Chunk.js';
+import { CHUNK_DEPTH, CHUNK_HEIGHT, CHUNK_SECTIONS, CHUNK_WIDTH, SECTION_HEIGHT } from './Chunk.js';
 import { buildChunkGeometryBuffers } from './MeshingCore.js';
 
 /**
- * Builds greedy-meshed Three.js geometries and meshes for chunks.
+ * Builds greedy-meshed Three.js geometries and meshes for chunks and 16x16x16 vertical sections.
  */
 export class ChunkMesher {
   /**
@@ -23,15 +23,24 @@ export class ChunkMesher {
 
     /** @type {{ value: number }} */
     this.skyBrightnessUniform = { value: 1.0 };
+    /** @type {'fast' | 'fancy'} */
+    this.graphicsMode = 'fast';
+    /** @type {boolean} */
+    this.shadowsEnabled = true;
 
     /** @private */
     this._tileRects = this.textureAtlas.exportTileRects();
+    /** @private */
+    this._blockTable = this.blockRegistry.exportMesherTable();
 
-    const materials = this._createMaterials();
-    /** @type {THREE.MeshStandardMaterial} */
-    this.opaqueMaterial = materials.opaqueMaterial;
-    /** @type {THREE.MeshStandardMaterial} */
-    this.waterMaterial = materials.waterMaterial;
+    this._materialsByMode = {
+      fast: this._createMaterials('fast'),
+      fancy: this._createMaterials('fancy'),
+    };
+    /** @type {THREE.Material} */
+    this.opaqueMaterial = this._materialsByMode.fast.opaqueMaterial;
+    /** @type {THREE.Material} */
+    this.waterMaterial = this._materialsByMode.fast.waterMaterial;
   }
 
   /**
@@ -43,16 +52,74 @@ export class ChunkMesher {
   }
 
   /**
-   * Creates shared PBR materials extending MeshStandardMaterial with atlas UV tiling
-   * and dual-bank GPU day/night + torch lighting.
+   * Switches between Fast (MeshLambertMaterial, lightweight fragment shader) and Fancy (PBR MeshStandardMaterial).
+   * Updates all existing loaded chunk meshes in-place without rebuilding geometry.
+   * @param {'fast'|'fancy'} mode
+   * @param {Iterable<import('./Chunk.js').Chunk>} [loadedChunks]
+   */
+  setGraphicsMode(mode, loadedChunks) {
+    const next = mode === 'fancy' ? 'fancy' : 'fast';
+    this.graphicsMode = next;
+    this.opaqueMaterial = this._materialsByMode[next].opaqueMaterial;
+    this.waterMaterial = this._materialsByMode[next].waterMaterial;
+    if (loadedChunks) {
+      for (const chunk of loadedChunks) {
+        this._syncChunkMaterials(chunk);
+      }
+    }
+  }
+
+  /**
+   * Toggles cast/receive shadows on chunk meshes.
+   * @param {boolean} enabled
+   * @param {Iterable<import('./Chunk.js').Chunk>} [loadedChunks]
+   */
+  setShadowsEnabled(enabled, loadedChunks) {
+    this.shadowsEnabled = Boolean(enabled);
+    if (loadedChunks) {
+      for (const chunk of loadedChunks) {
+        this._syncChunkMaterials(chunk);
+      }
+    }
+  }
+
+  /** @private */
+  _syncChunkMaterials(chunk) {
+    if (chunk.opaqueMesh) {
+      chunk.opaqueMesh.material = this.opaqueMaterial;
+      chunk.opaqueMesh.castShadow = this.shadowsEnabled;
+      chunk.opaqueMesh.receiveShadow = this.shadowsEnabled;
+    }
+    if (chunk.waterMesh) {
+      chunk.waterMesh.material = this.waterMaterial;
+      chunk.waterMesh.receiveShadow = this.shadowsEnabled;
+    }
+    for (let s = 0; s < CHUNK_SECTIONS; s++) {
+      const om = chunk.opaqueSections?.[s];
+      if (om) {
+        om.material = this.opaqueMaterial;
+        om.castShadow = this.shadowsEnabled;
+        om.receiveShadow = this.shadowsEnabled;
+      }
+      const wm = chunk.waterSections?.[s];
+      if (wm) {
+        wm.material = this.waterMaterial;
+        wm.receiveShadow = this.shadowsEnabled;
+      }
+    }
+  }
+
+  /**
+   * Creates shared materials extending MeshLambertMaterial (Fast) or MeshStandardMaterial (Fancy)
+   * with atlas UV tiling and dual-bank GPU day/night + torch lighting.
    * @private
    */
-  _createMaterials() {
+  _createMaterials(mode) {
     const skyUniform = this.skyBrightnessUniform;
 
     const injectAtlasTiling = (material, isWater = false) => {
       material.customProgramCacheKey = () =>
-        isWater ? 'voxel-atlas-lit-water-v2' : 'voxel-atlas-lit-opaque-v2';
+        `voxel-atlas-lit-${mode}-${isWater ? 'water' : 'opaque'}-v3`;
 
       material.onBeforeCompile = (shader) => {
         shader.uniforms.uSkyBrightness = skyUniform;
@@ -90,44 +157,31 @@ export class ChunkMesher {
       return material;
     };
 
-    const opaqueMaterial = injectAtlasTiling(
-      new THREE.MeshStandardMaterial({
-        map: this.textureAtlas.texture,
-        vertexColors: true,
-        roughness: 0.88,
-        metalness: 0.02,
-        alphaTest: 0.4,
-        side: THREE.FrontSide,
-      }),
-      false
-    );
+    const MatClass = mode === 'fancy' ? THREE.MeshStandardMaterial : THREE.MeshLambertMaterial;
+    const opaqueOpts = {
+      map: this.textureAtlas.texture,
+      vertexColors: true,
+      alphaTest: 0.4,
+      side: THREE.FrontSide,
+      ...(mode === 'fancy' ? { roughness: 0.88, metalness: 0.02 } : {}),
+    };
+    const waterOpts = {
+      map: this.textureAtlas.texture,
+      vertexColors: true,
+      transparent: true,
+      opacity: 0.78,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+      ...(mode === 'fancy' ? { roughness: 0.14, metalness: 0.06 } : {}),
+    };
 
-    const waterMaterial = injectAtlasTiling(
-      new THREE.MeshStandardMaterial({
-        map: this.textureAtlas.texture,
-        vertexColors: true,
-        roughness: 0.14,
-        metalness: 0.06,
-        transparent: true,
-        opacity: 0.78,
-        depthWrite: false,
-        side: THREE.DoubleSide,
-      }),
-      true
-    );
-
+    const opaqueMaterial = injectAtlasTiling(new MatClass(opaqueOpts), false);
+    const waterMaterial = injectAtlasTiling(new MatClass(waterOpts), true);
     return { opaqueMaterial, waterMaterial };
   }
 
-  /**
-   * Synchronously builds and attaches Three.js meshes onto the given chunk.
-   * @param {import('./Chunk.js').Chunk} chunk
-   * @param {(wx: number, wy: number, wz: number) => number} getWorldBlock
-   * @param {(wx: number, wy: number, wz: number) => { sky: number, block: number }} [getWorldLight]
-   * @param {(wx: number, wy: number, wz: number) => number} [getWorldFluidLevel]
-   * @returns {{ group: THREE.Group, opaqueMesh: THREE.Mesh|null, waterMesh: THREE.Mesh|null, faceCount: number, triangleCount: number }}
-   */
-  buildChunkMesh(chunk, getWorldBlock, getWorldLight, getWorldFluidLevel) {
+  /** @private */
+  _makeLookups(chunk, getWorldBlock, getWorldLight, getWorldFluidLevel) {
     const lightLookup =
       typeof getWorldLight === 'function' ? getWorldLight : () => ({ sky: 15, block: 0 });
     const fluidLookup =
@@ -159,23 +213,122 @@ export class ChunkMesher {
       return fluidLookup(chunk.worldX + lx, y, chunk.worldZ + lz);
     };
 
-    const built = buildChunkGeometryBuffers({
-      getBlockAtLocal,
-      getLightAtLocal,
-      getFluidLevelAtLocal,
-      blockTable: this.blockRegistry.exportMesherTable(),
-      tileRects: this._tileRects,
-    });
-
-    return this.applyMeshBuffers(chunk, built);
+    return { getBlockAtLocal, getLightAtLocal, getFluidLevelAtLocal };
   }
 
   /**
-   * Uploads raw TypedArray buffers (from main thread or Web Worker) into Three.js BufferGeometry
+   * Synchronously builds dirty 16x16x16 sub-chunk sections (or all 8 sections on first build)
+   * so interactive block breaks/placements only remesh a single 16x16x16 slice!
+   * @param {import('./Chunk.js').Chunk} chunk
+   * @param {(wx: number, wy: number, wz: number) => number} getWorldBlock
+   * @param {(wx: number, wy: number, wz: number) => { sky: number, block: number }} [getWorldLight]
+   * @param {(wx: number, wy: number, wz: number) => number} [getWorldFluidLevel]
+   */
+  buildChunkMesh(chunk, getWorldBlock, getWorldLight, getWorldFluidLevel) {
+    const lookups = this._makeLookups(chunk, getWorldBlock, getWorldLight, getWorldFluidLevel);
+
+    // If switching from monolithic worker mesh to per-section meshes, clear old monolithic meshes and rebuild all 8 sections
+    if (!chunk.usingSectionMeshes) {
+      chunk.disposeMesh(true);
+      chunk.dirtySectionsMask = 0xff;
+      chunk.usingSectionMeshes = true;
+    }
+
+    const group = chunk.meshGroup ?? new THREE.Group();
+    group.name = `chunk_${chunk.chunkX}_${chunk.chunkZ}`;
+    group.position.set(chunk.worldX, 0, chunk.worldZ);
+    chunk.meshGroup = group;
+
+    let totalFaces = 0;
+    let totalTriangles = 0;
+    const mask = chunk.dirtySectionsMask || 0xff;
+
+    for (let sec = 0; sec < CHUNK_SECTIONS; sec++) {
+      if ((mask & (1 << sec)) === 0) continue;
+      const yMin = sec * SECTION_HEIGHT;
+      const yMax = yMin + SECTION_HEIGHT;
+
+      // Fast empty-section skip (check if all 4096 voxels in section are AIR)
+      const startIdx = yMin << 8;
+      const endIdx = yMax << 8;
+      let hasBlock = false;
+      for (let i = startIdx; i < endIdx; i++) {
+        if (chunk.blocks[i] !== BLOCK_IDS.AIR) {
+          hasBlock = true;
+          break;
+        }
+      }
+
+      if (!hasBlock) {
+        chunk.disposeSectionMesh(sec);
+        continue;
+      }
+
+      const built = buildChunkGeometryBuffers({
+        ...lookups,
+        blockTable: this._blockTable,
+        tileRects: this._tileRects,
+        yMin,
+        yMax,
+      });
+
+      this.applySectionBuffers(chunk, sec, built);
+      totalFaces += built.faceCount ?? 0;
+      totalTriangles += built.triangleCount ?? 0;
+    }
+
+    chunk.dirtySectionsMask = 0;
+    chunk.dirty = false;
+
+    return {
+      group,
+      opaqueMesh: chunk.opaqueMesh,
+      waterMesh: chunk.waterMesh,
+      faceCount: totalFaces,
+      triangleCount: totalTriangles,
+    };
+  }
+
+  /**
+   * Attaches newly built TypedArray buffers to a single 16x16x16 vertical section mesh.
+   * @param {import('./Chunk.js').Chunk} chunk
+   * @param {number} secY 0..7
+   * @param {{ opaque: any, water: any }} built
+   */
+  applySectionBuffers(chunk, secY, built) {
+    chunk.disposeSectionMesh(secY);
+    const group = chunk.meshGroup;
+    if (!group) return;
+
+    if (built.opaque) {
+      const geo = this._toBufferGeometry(built.opaque);
+      const mesh = new THREE.Mesh(geo, this.opaqueMaterial);
+      mesh.name = `${group.name}_sec${secY}_opaque`;
+      mesh.castShadow = this.shadowsEnabled;
+      mesh.receiveShadow = this.shadowsEnabled;
+      mesh.frustumCulled = true;
+      group.add(mesh);
+      chunk.opaqueSections[secY] = mesh;
+    }
+
+    if (built.water) {
+      const geo = this._toBufferGeometry(built.water);
+      const mesh = new THREE.Mesh(geo, this.waterMaterial);
+      mesh.name = `${group.name}_sec${secY}_water`;
+      mesh.castShadow = false;
+      mesh.receiveShadow = this.shadowsEnabled;
+      mesh.frustumCulled = true;
+      mesh.renderOrder = 2;
+      group.add(mesh);
+      chunk.waterSections[secY] = mesh;
+    }
+  }
+
+  /**
+   * Uploads raw full-chunk TypedArray buffers (from Web Worker) into Three.js BufferGeometry
    * and attaches meshes to the chunk.
    * @param {import('./Chunk.js').Chunk} chunk
    * @param {{ opaque: any, water: any, faceCount: number, triangleCount: number }} built
-   * @returns {{ group: THREE.Group, opaqueMesh: THREE.Mesh|null, waterMesh: THREE.Mesh|null, faceCount: number, triangleCount: number }}
    */
   applyMeshBuffers(chunk, built) {
     chunk.disposeMesh(true);
@@ -191,8 +344,8 @@ export class ChunkMesher {
       const geo = this._toBufferGeometry(built.opaque);
       opaqueMesh = new THREE.Mesh(geo, this.opaqueMaterial);
       opaqueMesh.name = `${group.name}_opaque`;
-      opaqueMesh.castShadow = true;
-      opaqueMesh.receiveShadow = true;
+      opaqueMesh.castShadow = this.shadowsEnabled;
+      opaqueMesh.receiveShadow = this.shadowsEnabled;
       opaqueMesh.frustumCulled = true;
       group.add(opaqueMesh);
     }
@@ -202,7 +355,7 @@ export class ChunkMesher {
       waterMesh = new THREE.Mesh(geo, this.waterMaterial);
       waterMesh.name = `${group.name}_water`;
       waterMesh.castShadow = false;
-      waterMesh.receiveShadow = true;
+      waterMesh.receiveShadow = this.shadowsEnabled;
       waterMesh.frustumCulled = true;
       waterMesh.renderOrder = 2;
       group.add(waterMesh);
@@ -211,6 +364,8 @@ export class ChunkMesher {
     chunk.meshGroup = group;
     chunk.opaqueMesh = opaqueMesh;
     chunk.waterMesh = waterMesh;
+    chunk.usingSectionMeshes = false;
+    chunk.dirtySectionsMask = 0;
     chunk.dirty = false;
 
     return {
@@ -244,7 +399,9 @@ export class ChunkMesher {
    * Releases shared material GPU resources.
    */
   dispose() {
-    this.opaqueMaterial?.dispose();
-    this.waterMaterial?.dispose();
+    this._materialsByMode.fast.opaqueMaterial?.dispose();
+    this._materialsByMode.fast.waterMaterial?.dispose();
+    this._materialsByMode.fancy.opaqueMaterial?.dispose();
+    this._materialsByMode.fancy.waterMaterial?.dispose();
   }
 }

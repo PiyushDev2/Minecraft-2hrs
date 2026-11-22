@@ -111,7 +111,7 @@ export function isBoxCollidingWithWorld(world, box) {
 }
 
 /**
- * Checks whether an AABB overlaps any liquid (water) block in the world.
+ * Checks whether an AABB overlaps any liquid (water or lava) block in the world.
  * @param {import('../world/World.js').World} world
  * @param {AABB} box
  * @returns {boolean}
@@ -129,6 +129,58 @@ export function isBoxInLiquid(world, box) {
       for (let x = minBX; x <= maxBX; x++) {
         const blockId = world.getBlock(x, y, z);
         if (world.blockRegistry.isLiquid(blockId)) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Checks whether an AABB overlaps any water block in the world.
+ * @param {import('../world/World.js').World} world
+ * @param {AABB} box
+ * @returns {boolean}
+ */
+export function isBoxInWater(world, box) {
+  const minBX = Math.floor(box.minX + EPSILON);
+  const maxBX = Math.floor(box.maxX - EPSILON);
+  const minBY = Math.floor(box.minY + EPSILON);
+  const maxBY = Math.floor(box.maxY - EPSILON);
+  const minBZ = Math.floor(box.minZ + EPSILON);
+  const maxBZ = Math.floor(box.maxZ - EPSILON);
+
+  for (let y = minBY; y <= maxBY; y++) {
+    for (let z = minBZ; z <= maxBZ; z++) {
+      for (let x = minBX; x <= maxBX; x++) {
+        if (world.blockRegistry.isWater(world.getBlock(x, y, z))) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Checks whether an AABB overlaps any lava block in the world.
+ * @param {import('../world/World.js').World} world
+ * @param {AABB} box
+ * @returns {boolean}
+ */
+export function isBoxInLava(world, box) {
+  const minBX = Math.floor(box.minX + EPSILON);
+  const maxBX = Math.floor(box.maxX - EPSILON);
+  const minBY = Math.floor(box.minY + EPSILON);
+  const maxBY = Math.floor(box.maxY - EPSILON);
+  const minBZ = Math.floor(box.minZ + EPSILON);
+  const maxBZ = Math.floor(box.maxZ - EPSILON);
+
+  for (let y = minBY; y <= maxBY; y++) {
+    for (let z = minBZ; z <= maxBZ; z++) {
+      for (let x = minBX; x <= maxBX; x++) {
+        if (world.blockRegistry.isLava(world.getBlock(x, y, z))) {
           return true;
         }
       }

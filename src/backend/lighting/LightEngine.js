@@ -16,6 +16,41 @@ const NEIGHBORS = [
 ];
 
 /**
+ * Fast growable Int32Array queue storing 4 integers (x, y, z, level) per entry.
+ * Eliminates JS array boxing and GC churn during BFS flood fills.
+ */
+class LightQueue {
+  constructor(initialCapacity = 4096) {
+    this.data = new Int32Array(initialCapacity * 4);
+    this.head = 0;
+    this.tail = 0;
+  }
+
+  reset() {
+    this.head = 0;
+    this.tail = 0;
+  }
+
+  get size() {
+    return (this.tail - this.head) >> 2;
+  }
+
+  push(x, y, z, level) {
+    if (this.tail + 4 > this.data.length) {
+      const next = new Int32Array(this.data.length * 2);
+      next.set(this.data);
+      this.data = next;
+    }
+    const t = this.tail;
+    this.data[t] = x;
+    this.data[t + 1] = y;
+    this.data[t + 2] = z;
+    this.data[t + 3] = level;
+    this.tail = t + 4;
+  }
+}
+
+/**
  * Computes and incrementally updates packed SkyLight & BlockLight across chunks.
  */
 export class LightEngine {
@@ -26,6 +61,20 @@ export class LightEngine {
   constructor(chunkManager, blockRegistry) {
     this.chunkManager = chunkManager;
     this.blockRegistry = blockRegistry;
+
+    // Reusable typed-array BFS queues (zero per-edit heap allocations)
+    this._skyAddQ = new LightQueue(8192);
+    this._skyRemQ = new LightQueue(4096);
+    this._blockAddQ = new LightQueue(8192);
+    this._blockRemQ = new LightQueue(4096);
+  }
+
+  /**
+   * Returns true if the active dimension has overhead sunlight.
+   * @private
+   */
+  _hasSkyLight() {
+    return this.chunkManager?.terrainGenerator?.dimension !== 'nether';
   }
 
   /**
@@ -37,12 +86,13 @@ export class LightEngine {
    */
   getLight(wx, wy, wz) {
     const iy = Math.floor(wy);
-    if (iy >= CHUNK_HEIGHT) return { sky: 15, block: 0 };
+    const defaultSky = this._hasSkyLight() ? 15 : 0;
+    if (iy >= CHUNK_HEIGHT) return { sky: defaultSky, block: 0 };
     if (iy < 0) return { sky: 0, block: 0 };
 
     const { chunkX, chunkZ, lx, lz } = this.chunkManager.worldToChunkCoord(wx, wz);
     const chunk = this.chunkManager.getChunk(chunkX, chunkZ);
-    if (!chunk) return { sky: 15, block: 0 };
+    if (!chunk) return { sky: defaultSky, block: 0 };
 
     const byte = chunk.lightData[(iy << 8) | (lz << 4) | lx];
     return {
@@ -55,11 +105,12 @@ export class LightEngine {
    * @private
    */
   _getSky(wx, wy, wz) {
-    if (wy >= CHUNK_HEIGHT) return 15;
+    const defaultSky = this._hasSkyLight() ? 15 : 0;
+    if (wy >= CHUNK_HEIGHT) return defaultSky;
     if (wy < 0) return 0;
     const { chunkX, chunkZ, lx, lz } = this.chunkManager.worldToChunkCoord(wx, wz);
     const chunk = this.chunkManager.getChunk(chunkX, chunkZ);
-    if (!chunk) return 15;
+    if (!chunk) return defaultSky;
     return chunk.getSkyLight(lx, wy, lz);
   }
 
@@ -75,6 +126,7 @@ export class LightEngine {
     if (prev === val) return false;
     chunk.setSkyLight(lx, wy, lz, val);
     chunk.dirty = true;
+    chunk.markSectionDirty?.(wy);
     dirtyChunks?.add(chunk);
     return true;
   }
@@ -102,6 +154,7 @@ export class LightEngine {
     if (prev === val) return false;
     chunk.setBlockLight(lx, wy, lz, val);
     chunk.dirty = true;
+    chunk.markSectionDirty?.(wy);
     dirtyChunks?.add(chunk);
     return true;
   }
@@ -122,15 +175,19 @@ export class LightEngine {
   computeChunkLight(chunk) {
     chunk.lightData.fill(0);
 
-    const skyQueue = [];
-    const blockQueue = [];
+    const skyQueue = this._skyAddQ;
+    const blockQueue = this._blockAddQ;
+    skyQueue.reset();
+    blockQueue.reset();
+
+    const hasSky = this._hasSkyLight();
 
     // 1. Top-down direct sunlight & emitter scan
     for (let lz = 0; lz < CHUNK_DEPTH; lz++) {
       const wz = chunk.worldZ + lz;
       for (let lx = 0; lx < CHUNK_WIDTH; lx++) {
         const wx = chunk.worldX + lx;
-        let sky = 15;
+        let sky = hasSky ? 15 : 0;
 
         for (let y = CHUNK_HEIGHT - 1; y >= 0; y--) {
           const idx = (y << 8) | (lz << 4) | lx;
@@ -160,41 +217,45 @@ export class LightEngine {
     }
 
     // 2. Seed sky BFS wherever lit air borders darker air (caves/overhangs) or chunk boundaries
-    for (let lz = 0; lz < CHUNK_DEPTH; lz++) {
-      const wz = chunk.worldZ + lz;
-      for (let lx = 0; lx < CHUNK_WIDTH; lx++) {
-        const wx = chunk.worldX + lx;
-        for (let y = CHUNK_HEIGHT - 1; y >= 0; y--) {
-          const sky = chunk.getSkyLight(lx, y, lz);
-          if (sky <= 1) continue;
+    if (hasSky) {
+      for (let lz = 0; lz < CHUNK_DEPTH; lz++) {
+        const wz = chunk.worldZ + lz;
+        for (let lx = 0; lx < CHUNK_WIDTH; lx++) {
+          const wx = chunk.worldX + lx;
+          for (let y = CHUNK_HEIGHT - 1; y >= 0; y--) {
+            const sky = chunk.getSkyLight(lx, y, lz);
+            if (sky <= 1) continue;
 
-          // Seed if an adjacent horizontal voxel has lower sky light
-          let needsSpread = false;
-          for (let n = 0; n < 4; n++) {
-            const nx = wx + NEIGHBORS[n][0];
-            const nz = wz + NEIGHBORS[n][2];
-            if (!this._hasLoadedChunkAt(nx, nz)) continue;
-            const nId = this.chunkManager.getBlock(nx, y, nz);
-            if (this.blockRegistry.getLightAttenuation(nId) < 15) {
-              const nSky = this._getSky(nx, y, nz);
-              if (nSky < sky - 1) {
-                needsSpread = true;
-                break;
+            // Seed if an adjacent horizontal voxel has lower sky light
+            let needsSpread = false;
+            for (let n = 0; n < 4; n++) {
+              const nx = wx + NEIGHBORS[n][0];
+              const nz = wz + NEIGHBORS[n][2];
+              if (!this._hasLoadedChunkAt(nx, nz)) continue;
+              const nId = this.chunkManager.getBlock(nx, y, nz);
+              if (this.blockRegistry.getLightAttenuation(nId) < 15) {
+                const nSky = this._getSky(nx, y, nz);
+                if (nSky < sky - 1) {
+                  needsSpread = true;
+                  break;
+                }
               }
             }
-          }
-          if (needsSpread) {
-            skyQueue.push(wx, y, wz, sky);
+            if (needsSpread) {
+              skyQueue.push(wx, y, wz, sky);
+            }
           }
         }
       }
     }
 
     // Also pull sky & block light across already-loaded neighbor chunk borders
-    this._seedFromNeighborBorders(chunk, skyQueue, blockQueue);
+    this._seedFromNeighborBorders(chunk, skyQueue, blockQueue, hasSky);
 
     const dirtyChunks = new Set([chunk]);
-    this._propagateSkyAdd(skyQueue, dirtyChunks);
+    if (hasSky) {
+      this._propagateSkyAdd(skyQueue, dirtyChunks);
+    }
     this._propagateBlockAdd(blockQueue, dirtyChunks);
 
     chunk.lightDirty = false;
@@ -204,7 +265,7 @@ export class LightEngine {
    * Pulls boundary light from already-loaded neighbor chunks into a newly generated chunk.
    * @private
    */
-  _seedFromNeighborBorders(chunk, skyQueue, blockQueue) {
+  _seedFromNeighborBorders(chunk, skyQueue, blockQueue, hasSky = true) {
     const borders = [
       { dx: -1, dz: 0, startX: chunk.worldX - 1, endX: chunk.worldX - 1, startZ: chunk.worldZ, endZ: chunk.worldZ + CHUNK_DEPTH - 1 },
       { dx: 1, dz: 0, startX: chunk.worldX + CHUNK_WIDTH, endX: chunk.worldX + CHUNK_WIDTH, startZ: chunk.worldZ, endZ: chunk.worldZ + CHUNK_DEPTH - 1 },
@@ -217,8 +278,10 @@ export class LightEngine {
       for (let wz = b.startZ; wz <= b.endZ; wz++) {
         for (let wx = b.startX; wx <= b.endX; wx++) {
           for (let y = 0; y < CHUNK_HEIGHT; y++) {
-            const s = this._getSky(wx, y, wz);
-            if (s > 1) skyQueue.push(wx, y, wz, s);
+            if (hasSky) {
+              const s = this._getSky(wx, y, wz);
+              if (s > 1) skyQueue.push(wx, y, wz, s);
+            }
             const bl = this._getBlockLight(wx, y, wz);
             if (bl > 1) blockQueue.push(wx, y, wz, bl);
           }
@@ -248,8 +311,10 @@ export class LightEngine {
     const newAtten = this.blockRegistry.getLightAttenuation(newId);
 
     // --- 1. Artificial BlockLight ---
-    const blockAddQueue = [];
-    const blockRemoveQueue = [];
+    const blockAddQueue = this._blockAddQ;
+    const blockRemoveQueue = this._blockRemQ;
+    blockAddQueue.reset();
+    blockRemoveQueue.reset();
     const oldBlockLight = this._getBlockLight(ix, iy, iz);
 
     if (prevEmission > 0 || (newAtten > prevAtten && oldBlockLight > 0)) {
@@ -259,7 +324,7 @@ export class LightEngine {
       }
     }
 
-    if (blockRemoveQueue.length > 0) {
+    if (blockRemoveQueue.size > 0) {
       this._propagateBlockRemove(blockRemoveQueue, blockAddQueue, dirtyChunks);
     }
 
@@ -279,13 +344,17 @@ export class LightEngine {
       }
     }
 
-    if (blockAddQueue.length > 0) {
+    if (blockAddQueue.size > 0) {
       this._propagateBlockAdd(blockAddQueue, dirtyChunks);
     }
 
     // --- 2. SkyLight ---
-    const skyAddQueue = [];
-    const skyRemoveQueue = [];
+    if (!this._hasSkyLight()) return;
+
+    const skyAddQueue = this._skyAddQ;
+    const skyRemoveQueue = this._skyRemQ;
+    skyAddQueue.reset();
+    skyRemoveQueue.reset();
     const oldSky = this._getSky(ix, iy, iz);
 
     if (newAtten > prevAtten && oldSky > 0) {
@@ -359,19 +428,21 @@ export class LightEngine {
       }
     }
 
-    if (skyAddQueue.length > 0) {
+    if (skyAddQueue.size > 0) {
       this._propagateSkyAdd(skyAddQueue, dirtyChunks);
     }
   }
 
   /** @private */
   _propagateBlockAdd(queue, dirtyChunks) {
-    let head = 0;
-    while (head < queue.length) {
-      const x = queue[head++];
-      const y = queue[head++];
-      const z = queue[head++];
-      const level = queue[head++];
+    while (queue.head < queue.tail) {
+      const h = queue.head;
+      const data = queue.data;
+      const x = data[h];
+      const y = data[h + 1];
+      const z = data[h + 2];
+      const level = data[h + 3];
+      queue.head = h + 4;
 
       if (level <= 1 || this._getBlockLight(x, y, z) < level) continue;
 
@@ -398,12 +469,14 @@ export class LightEngine {
 
   /** @private */
   _propagateBlockRemove(removeQueue, addQueue, dirtyChunks) {
-    let head = 0;
-    while (head < removeQueue.length) {
-      const x = removeQueue[head++];
-      const y = removeQueue[head++];
-      const z = removeQueue[head++];
-      const oldLevel = removeQueue[head++];
+    while (removeQueue.head < removeQueue.tail) {
+      const h = removeQueue.head;
+      const data = removeQueue.data;
+      const x = data[h];
+      const y = data[h + 1];
+      const z = data[h + 2];
+      const oldLevel = data[h + 3];
+      removeQueue.head = h + 4;
 
       for (let i = 0; i < 6; i++) {
         const nx = x + NEIGHBORS[i][0];
@@ -433,12 +506,14 @@ export class LightEngine {
 
   /** @private */
   _propagateSkyAdd(queue, dirtyChunks) {
-    let head = 0;
-    while (head < queue.length) {
-      const x = queue[head++];
-      const y = queue[head++];
-      const z = queue[head++];
-      const level = queue[head++];
+    while (queue.head < queue.tail) {
+      const h = queue.head;
+      const data = queue.data;
+      const x = data[h];
+      const y = data[h + 1];
+      const z = data[h + 2];
+      const level = data[h + 3];
+      queue.head = h + 4;
 
       if (level <= 1 || this._getSky(x, y, z) < level) continue;
 
@@ -473,12 +548,14 @@ export class LightEngine {
 
   /** @private */
   _propagateSkyRemove(removeQueue, addQueue, dirtyChunks) {
-    let head = 0;
-    while (head < removeQueue.length) {
-      const x = removeQueue[head++];
-      const y = removeQueue[head++];
-      const z = removeQueue[head++];
-      const oldLevel = removeQueue[head++];
+    while (removeQueue.head < removeQueue.tail) {
+      const h = removeQueue.head;
+      const data = removeQueue.data;
+      const x = data[h];
+      const y = data[h + 1];
+      const z = data[h + 2];
+      const oldLevel = data[h + 3];
+      removeQueue.head = h + 4;
 
       for (let i = 0; i < 6; i++) {
         const dy = NEIGHBORS[i][1];
@@ -491,7 +568,6 @@ export class LightEngine {
         if (neighborLevel === 0) continue;
 
         if (neighborLevel < oldLevel || (dy === -1 && oldLevel === 15 && neighborLevel === 15)) {
-          // Wait: if neighbor directly below is 15 because of us, only clear if it has no open sky above it
           if (dy === -1 && neighborLevel === 15) {
             this._setSky(nx, ny, nz, 0, dirtyChunks);
             removeQueue.push(nx, ny, nz, 15);

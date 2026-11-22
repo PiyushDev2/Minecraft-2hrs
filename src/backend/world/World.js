@@ -48,8 +48,14 @@ export class World {
     this.textureAtlas = new TextureAtlas();
     /** @type {ChunkMesher} */
     this.chunkMesher = new ChunkMesher(this.blockRegistry, this.textureAtlas);
+    /** @type {'overworld'|'nether'|'end'} */
+    this.dimension = 'overworld';
+    /** @type {{ overworld: Record<string, any>, nether: Record<string, any>, end: Record<string, any> }} */
+    this._dimensionMods = { overworld: {}, nether: {}, end: {} };
+    /** @type {((wx:number, wy:number, wz:number, kind:string) => void)|null} */
+    this._onStructureChestSpawn = null;
     /** @type {TerrainGenerator} */
-    this.terrainGenerator = new TerrainGenerator(this.seed);
+    this.terrainGenerator = new TerrainGenerator(this.seed, this.dimension);
     /** @type {ChunkManager} */
     this.chunkManager = new ChunkManager({
       terrainGenerator: this.terrainGenerator,
@@ -78,17 +84,29 @@ export class World {
   }
 
   /**
-   * Generates or regenerates the world with a given seed and preloads spawn chunks.
-   * @param {number|string} [seed=this.seed]
-   * @param {Object} [options]
-   * @param {{ x: number, z: number }} [options.spawnCenter={ x: 8, z: 8 }]
-   * @param {number} [options.pregenerateRadius=2]
-   * @returns {World}
+   * Registers a callback invoked when procedural structures place a loot chest.
+   * Preserved across world regenerations and dimension transitions.
    */
-  generate(seed = this.seed, { spawnCenter = { x: 8, z: 8 }, pregenerateRadius = 2 } = {}) {
+  setStructureChestCallback(cb) {
+    this._onStructureChestSpawn = cb;
+    if (this.terrainGenerator) {
+      this.terrainGenerator.onStructureChestSpawn = cb;
+    }
+  }
+
+  /**
+   * Generates or regenerates the world with a given seed and preloads spawn chunks.
+   */
+  generate(
+    seed = this.seed,
+    { spawnCenter = { x: 8, z: 8 }, pregenerateRadius = 2, dimension = 'overworld' } = {}
+  ) {
     this.chunkManager.clear();
     this.seed = normalizeSeed(seed);
-    this.terrainGenerator = new TerrainGenerator(this.seed);
+    this.dimension = dimension === 'nether' ? 'nether' : dimension === 'end' ? 'end' : 'overworld';
+    this._dimensionMods = { overworld: {}, nether: {}, end: {} };
+    this.terrainGenerator = new TerrainGenerator(this.seed, this.dimension);
+    this.terrainGenerator.onStructureChestSpawn = this._onStructureChestSpawn;
     this.chunkManager.terrainGenerator = this.terrainGenerator;
     this.worldTime = 0;
     this.setTimeOfDay(0.25);
@@ -97,6 +115,66 @@ export class World {
       this.chunkManager.pregenerateAround(spawnCenter.x, spawnCenter.z, pregenerateRadius);
     }
     return this;
+  }
+
+  /**
+   * Switches active dimension between 'overworld', 'nether', and 'end', preserving modifications
+   * for all dimensions independently.
+   * @param {'overworld'|'nether'|'end'} targetDim
+   * @param {{ x: number, z: number }} [spawnCenter={ x: 8, z: 8 }]
+   * @param {number} [pregenerateRadius=2]
+   */
+  setDimension(targetDim, spawnCenter = { x: 8, z: 8 }, pregenerateRadius = 2) {
+    const nextDim = targetDim === 'nether' ? 'nether' : targetDim === 'end' ? 'end' : 'overworld';
+    if (nextDim === this.dimension) return this;
+
+    // Archive current dimension modifications before clearing chunks
+    this._dimensionMods[this.dimension] = this.chunkManager.exportAllModifications();
+    this.chunkManager.clear();
+
+    this.dimension = nextDim;
+    this.terrainGenerator = new TerrainGenerator(this.seed, this.dimension);
+    this.terrainGenerator.onStructureChestSpawn = this._onStructureChestSpawn;
+    this.chunkManager.terrainGenerator = this.terrainGenerator;
+
+    const savedMods = this._dimensionMods[this.dimension];
+    if (savedMods && Object.keys(savedMods).length > 0) {
+      this.chunkManager.importModifications(savedMods);
+    }
+
+    this.chunkMesher.setSkyBrightness(this.getSkyBrightness());
+
+    if (pregenerateRadius >= 0) {
+      this.chunkManager.pregenerateAround(spawnCenter.x, spawnCenter.z, pregenerateRadius);
+    }
+    return this;
+  }
+
+  /**
+   * Exports modifications for Overworld, Nether, and End dimensions for multi-dimension saves.
+   */
+  exportAllDimensionModifications() {
+    this._dimensionMods[this.dimension] = this.chunkManager.exportAllModifications();
+    return {
+      overworld: { ...this._dimensionMods.overworld },
+      nether: { ...this._dimensionMods.nether },
+      end: { ...this._dimensionMods.end },
+    };
+  }
+
+  /**
+   * Restores cached modifications for Overworld, Nether, and End dimensions.
+   */
+  importAllDimensionModifications(overworldMods = {}, netherMods = {}, endMods = {}) {
+    this._dimensionMods = {
+      overworld: overworldMods ? { ...overworldMods } : {},
+      nether: netherMods ? { ...netherMods } : {},
+      end: endMods ? { ...endMods } : {},
+    };
+    const activeMods = this._dimensionMods[this.dimension];
+    if (activeMods && Object.keys(activeMods).length > 0) {
+      this.chunkManager.importModifications(activeMods);
+    }
   }
 
   /**
@@ -121,10 +199,16 @@ export class World {
   }
 
   /**
-   * Returns current global sky brightness factor [0.16 midnight .. 1.0 noon].
+   * Returns current global sky brightness factor [0.16 midnight .. 1.0 noon], or dim Nether ambient.
    * @returns {number}
    */
   getSkyBrightness() {
+    if (this.dimension === 'nether') {
+      return 0.42;
+    }
+    if (this.dimension === 'end') {
+      return 0.58;
+    }
     const sunElevation = Math.sin(this.timeOfDay * Math.PI * 2);
     const smooth = Math.max(0, Math.min(1, (sunElevation + 0.2) / 0.7));
     return 0.16 + 0.84 * smooth;
@@ -235,7 +319,7 @@ export class World {
     if (!changed) return false;
 
     if (immediateRemesh && recordModification) {
-      this.chunkManager.remeshNeighborhoodForBlock(ix, iz);
+      this.chunkManager.remeshNeighborhoodForBlock(ix, iz, iy);
     }
 
     for (const cb of this._onBlockChanged) {
@@ -347,6 +431,32 @@ export class World {
     const iz = Math.floor(wz);
     const { chunkX, chunkZ, lx, lz } = this.chunkManager.worldToChunkCoord(ix, iz);
     const chunk = this.chunkManager.getChunk(chunkX, chunkZ);
+
+    if (this.dimension === 'nether') {
+      if (chunk && chunk.generated) {
+        // Scan cavern interior below ceiling bedrock for a safe standing floor
+        for (let y = 84; y >= 20; y--) {
+          const id = chunk.getBlock(lx, y, lz);
+          if (
+            this.blockRegistry.isSolid(id) &&
+            !this.blockRegistry.isSolid(chunk.getBlock(lx, y + 1, lz)) &&
+            !this.blockRegistry.isSolid(chunk.getBlock(lx, y + 2, lz)) &&
+            !this.blockRegistry.isLiquid(chunk.getBlock(lx, y + 1, lz))
+          ) {
+            return y;
+          }
+        }
+      }
+      return this.terrainGenerator.getHeightAt(ix, iz);
+    }
+
+    if (this.dimension === 'end') {
+      if (chunk && chunk.generated) {
+        const top = chunk.getHighestY(lx, lz, (id) => this.blockRegistry.isSolid(id));
+        if (top >= 0) return top;
+      }
+      return Math.max(55, this.terrainGenerator.getHeightAt(ix, iz));
+    }
 
     if (chunk && chunk.generated) {
       const top = chunk.getHighestY(lx, lz, (id) => this.blockRegistry.isSolid(id));
@@ -503,6 +613,7 @@ export class World {
       : null;
     return {
       seed: this.seed,
+      dimension: this.dimension,
       loadedChunks: this.chunkManager.chunks.size,
       viewDistance: this.viewDistance,
       modifiedChunks: Object.keys(this.chunkManager.exportAllModifications()).length,

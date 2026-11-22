@@ -58,6 +58,7 @@ export class ChunkManager {
     this.viewDistance = viewDistance;
     this.maxChunksGeneratedPerFrame = maxChunksGeneratedPerFrame;
     this.maxChunksMeshedPerFrame = maxChunksMeshedPerFrame;
+    this.maxFrameBudgetMs = 4.5;
 
     /** @type {Map<string, Chunk>} */
     this.chunks = new Map();
@@ -163,7 +164,7 @@ export class ChunkManager {
       if (this.fluidSimulator) {
         for (let i = 0; i < savedMods.length; i++) {
           const [idx, blockId] = savedMods[i];
-          if (blockId === BLOCK_IDS.WATER) {
+          if (this.blockRegistry.isLiquid(blockId)) {
             const { lx, y, lz } = Chunk.decodeIndex(idx);
             this.fluidSimulator.scheduleNeighbors(chunk.worldX + lx, y, chunk.worldZ + lz);
           }
@@ -301,10 +302,10 @@ export class ChunkManager {
     if (!changed) return false;
     this._inFlightSignatures.delete(chunk.key);
 
-    if (lx === 0) this._dirtyIfLoaded(chunkX - 1, chunkZ);
-    if (lx === CHUNK_WIDTH - 1) this._dirtyIfLoaded(chunkX + 1, chunkZ);
-    if (lz === 0) this._dirtyIfLoaded(chunkX, chunkZ - 1);
-    if (lz === CHUNK_DEPTH - 1) this._dirtyIfLoaded(chunkX, chunkZ + 1);
+    if (lx === 0) this._dirtyIfLoaded(chunkX - 1, chunkZ, iy);
+    if (lx === CHUNK_WIDTH - 1) this._dirtyIfLoaded(chunkX + 1, chunkZ, iy);
+    if (lz === 0) this._dirtyIfLoaded(chunkX, chunkZ - 1, iy);
+    if (lz === CHUNK_DEPTH - 1) this._dirtyIfLoaded(chunkX, chunkZ + 1, iy);
     return true;
   }
 
@@ -334,7 +335,7 @@ export class ChunkManager {
     const prevId = chunk.getBlock(lx, iy, lz);
     const changed = chunk.setBlock(lx, iy, lz, blockId, recordModification);
     const fluidChanged =
-      fluidMeta !== undefined && blockId === BLOCK_IDS.WATER
+      fluidMeta !== undefined && this.blockRegistry.isLiquid(blockId)
         ? chunk.setFluidLevel(lx, iy, lz, fluidMeta)
         : false;
     if (!changed && !fluidChanged) return false;
@@ -345,11 +346,11 @@ export class ChunkManager {
       this.fluidSimulator?.onBlockChanged(ix, iy, iz, prevId, blockId);
     }
 
-    // If on chunk border, mark neighboring chunk dirty so adjacent face visibility updates
-    if (lx === 0) this._dirtyIfLoaded(chunkX - 1, chunkZ);
-    if (lx === CHUNK_WIDTH - 1) this._dirtyIfLoaded(chunkX + 1, chunkZ);
-    if (lz === 0) this._dirtyIfLoaded(chunkX, chunkZ - 1);
-    if (lz === CHUNK_DEPTH - 1) this._dirtyIfLoaded(chunkX, chunkZ + 1);
+    // If on chunk border, mark neighboring chunk section dirty so adjacent face visibility updates
+    if (lx === 0) this._dirtyIfLoaded(chunkX - 1, chunkZ, iy);
+    if (lx === CHUNK_WIDTH - 1) this._dirtyIfLoaded(chunkX + 1, chunkZ, iy);
+    if (lz === 0) this._dirtyIfLoaded(chunkX, chunkZ - 1, iy);
+    if (lz === CHUNK_DEPTH - 1) this._dirtyIfLoaded(chunkX, chunkZ + 1, iy);
 
     return true;
   }
@@ -512,6 +513,9 @@ export class ChunkManager {
       }
     }
 
+    const frameStart = typeof performance !== 'undefined' ? performance.now() : 0;
+    const budgetMs = this.maxFrameBudgetMs;
+
     if (missing.length > 0) {
       missing.sort((a, b) => a.distSq - b.distSq);
       const effectiveGenBudget =
@@ -521,6 +525,7 @@ export class ChunkManager {
       const genBudget = Math.min(effectiveGenBudget, missing.length);
       for (let i = 0; i < genBudget; i++) {
         this.loadChunk(missing[i].cx, missing[i].cz, false);
+        if (i >= 1 && performance.now() - frameStart >= budgetMs) break;
       }
     }
 
@@ -544,9 +549,10 @@ export class ChunkManager {
       const meshBudget = Math.min(effectiveMeshBudget, dirtyChunks.length);
       for (let i = 0; i < meshBudget; i++) {
         const entry = dirtyChunks[i];
-        // Remesh chunks immediately around the player synchronously so edits & fluids never lag visually
-        if (!useAsyncPool || entry.distSq <= 2) {
+        // Remesh chunks immediately around the player synchronously (using fast 16x16x16 dirty section meshing)
+        if (!useAsyncPool || entry.distSq <= 2 || entry.chunk.usingSectionMeshes) {
           this.remeshChunk(entry.chunk);
+          if (i >= 1 && performance.now() - frameStart >= budgetMs + 1.5) break;
         } else {
           this.remeshChunkAsync(entry.chunk);
         }
@@ -678,9 +684,15 @@ export class ChunkManager {
   }
 
   /** @private */
-  _dirtyIfLoaded(chunkX, chunkZ) {
+  _dirtyIfLoaded(chunkX, chunkZ, y = undefined) {
     const c = this.getChunk(chunkX, chunkZ);
-    if (c) c.dirty = true;
+    if (!c) return;
+    c.dirty = true;
+    if (y !== undefined) {
+      c.markSectionDirty(y);
+    } else {
+      c.dirtySectionsMask = 0xff;
+    }
   }
 
   /** @private */

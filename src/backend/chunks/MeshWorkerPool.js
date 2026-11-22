@@ -54,6 +54,10 @@ export class MeshWorkerPool {
     this.active = false;
     /** @type {boolean} */
     this.disposed = false;
+    /** @private */
+    this._blockTable = this.blockRegistry.exportMesherTable();
+    /** @private */
+    this._tileRects = this.textureAtlas.exportTileRects();
 
     this._initWorkers(workerFactory);
   }
@@ -67,8 +71,8 @@ export class MeshWorkerPool {
     const canUseBrowserWorker = typeof Worker !== 'undefined';
     if (!workerFactory && !canUseBrowserWorker) return;
 
-    const blockTable = this.blockRegistry.exportMesherTable();
-    const tileRects = this.textureAtlas.exportTileRects();
+    const blockTable = this._blockTable;
+    const tileRects = this._tileRects;
 
     for (let i = 0; i < this.poolSize; i++) {
       let worker;
@@ -184,8 +188,8 @@ export class MeshWorkerPool {
           getBlockAtLocal: (lx, y, lz) => region.getBlock(lx, y, lz),
           getLightAtLocal: (lx, y, lz) => region.getLight(lx, y, lz),
           getFluidLevelAtLocal: (lx, y, lz) => region.getFluidLevel(lx, y, lz),
-          blockTable: this.blockRegistry.exportMesherTable(),
-          tileRects: this.textureAtlas.exportTileRects(),
+          blockTable: this._blockTable,
+          tileRects: this._tileRects,
         });
 
         onResult({

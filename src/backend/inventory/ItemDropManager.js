@@ -6,8 +6,10 @@
 
 import * as THREE from 'three';
 
+const MAX_INSTANCED_DROPS = 256;
+
 /**
- * Coordinates physical world item drops and optional Three.js visual meshes.
+ * Coordinates physical world item drops rendered in a single GPU InstancedMesh draw call.
  */
 export class ItemDropManager {
   /**
@@ -20,44 +22,60 @@ export class ItemDropManager {
     this.itemRegistry = itemRegistry;
     this.inventory = inventory;
 
-    /**
-     * @type {Array<{
-     *   id: number,
-     *   itemId: string,
-     *   count: number,
-     *   position: { x: number, y: number, z: number },
-     *   velocity: { x: number, y: number, z: number },
-     *   age: number,
-     *   pickupDelay: number,
-     *   maxAge: number,
-     *   mesh: THREE.Mesh|null
-     * }>}
-     */
     this.drops = [];
     this._nextId = 1;
     /** @type {THREE.Scene|null} */
     this.scene = null;
     /** @type {THREE.BoxGeometry|null} */
     this._sharedGeometry = null;
+    /** @type {THREE.MeshLambertMaterial|null} */
+    this._sharedMaterial = null;
+    /** @type {THREE.InstancedMesh|null} */
+    this._instancedMesh = null;
+
+    this._dummy = new THREE.Object3D();
+    this._tmpColor = new THREE.Color();
   }
 
   /**
-   * Attaches a Three.js Scene to visualize dropped item cubes.
+   * Attaches a Three.js Scene to visualize dropped item cubes via one InstancedMesh.
    * @param {THREE.Scene|null} scene
    */
   attachScene(scene) {
-    if (this.scene) {
-      for (const drop of this.drops) {
-        if (drop.mesh) this.scene.remove(drop.mesh);
-      }
+    if (this.scene && this._instancedMesh) {
+      this.scene.remove(this._instancedMesh);
     }
     this.scene = scene;
     if (this.scene) {
-      for (const drop of this.drops) {
-        if (!drop.mesh) drop.mesh = this._createDropMesh(drop.itemId);
-        if (drop.mesh) this.scene.add(drop.mesh);
+      this._ensureInstancedMesh();
+      if (this._instancedMesh) {
+        this.scene.add(this._instancedMesh);
+        this._syncInstancedMesh();
       }
     }
+  }
+
+  /** @private */
+  _ensureInstancedMesh() {
+    if (this._instancedMesh) return;
+    this._sharedGeometry = new THREE.BoxGeometry(0.28, 0.28, 0.28);
+    this._sharedMaterial = new THREE.MeshLambertMaterial({ color: 0xffffff });
+    this._instancedMesh = new THREE.InstancedMesh(
+      this._sharedGeometry,
+      this._sharedMaterial,
+      MAX_INSTANCED_DROPS
+    );
+    this._instancedMesh.name = 'item_drops_instanced';
+    this._instancedMesh.count = 0;
+    this._instancedMesh.frustumCulled = false;
+    this._instancedMesh.castShadow = false;
+    this._instancedMesh.receiveShadow = false;
+    this._instancedMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this._instancedMesh.instanceColor = new THREE.InstancedBufferAttribute(
+      new Float32Array(MAX_INSTANCED_DROPS * 3).fill(1),
+      3
+    );
+    this._instancedMesh.instanceColor.setUsage(THREE.DynamicDrawUsage);
   }
 
   /**
@@ -73,12 +91,18 @@ export class ItemDropManager {
     const def = this.itemRegistry.get(itemId);
     if (!def || count <= 0) return null;
 
-    const angle = ((this._nextId * 2.39996) % (Math.PI * 2));
+    // Cap total drops to prevent runaway counts
+    if (this.drops.length >= MAX_INSTANCED_DROPS) {
+      this.drops.shift();
+    }
+
+    const angle = (this._nextId * 2.39996) % (Math.PI * 2);
     const speed = 1.3;
     const drop = {
       id: this._nextId++,
       itemId,
       count,
+      colorHex: def.color ?? 0xffffff,
       position: { x: wx, y: wy, z: wz },
       velocity: {
         x: Math.cos(angle) * speed,
@@ -88,15 +112,10 @@ export class ItemDropManager {
       age: 0,
       pickupDelay: 0.25,
       maxAge: 180,
-      mesh: this.scene ? this._createDropMesh(itemId) : null,
     };
 
-    if (drop.mesh && this.scene) {
-      drop.mesh.position.set(wx, wy, wz);
-      this.scene.add(drop.mesh);
-    }
-
     this.drops.push(drop);
+    this._syncInstancedMesh();
     return drop;
   }
 
@@ -108,6 +127,9 @@ export class ItemDropManager {
    */
   update(deltaTime, playerPos) {
     if (!Number.isFinite(deltaTime) || deltaTime <= 0 || this.drops.length === 0) {
+      if (this._instancedMesh && this._instancedMesh.count !== 0) {
+        this._instancedMesh.count = 0;
+      }
       return [];
     }
 
@@ -119,7 +141,7 @@ export class ItemDropManager {
       const d = this.drops[i];
       d.age += dt;
       if (d.age >= d.maxAge) {
-        this._removeDropAt(i);
+        this.drops.splice(i, 1);
         continue;
       }
 
@@ -172,69 +194,66 @@ export class ItemDropManager {
             pickedUp.push({ itemId: d.itemId, count: added });
           }
           if (remainder === 0) {
-            this._removeDropAt(i);
+            this.drops.splice(i, 1);
             continue;
           }
           d.count = remainder;
         }
       }
-
-      if (d.mesh) {
-        const bob = Math.sin(d.age * 3.4) * 0.08;
-        d.mesh.position.set(d.position.x, d.position.y + bob, d.position.z);
-        d.mesh.rotation.y = d.age * 1.8;
-      }
     }
 
+    this._syncInstancedMesh();
     return pickedUp;
+  }
+
+  /** @private */
+  _syncInstancedMesh() {
+    if (!this._instancedMesh) return;
+    const count = Math.min(this.drops.length, MAX_INSTANCED_DROPS);
+    this._instancedMesh.count = count;
+    if (count === 0) return;
+
+    for (let i = 0; i < count; i++) {
+      const d = this.drops[i];
+      const bob = Math.sin(d.age * 3.4 + d.id) * 0.08;
+      this._dummy.position.set(d.position.x, d.position.y + bob, d.position.z);
+      this._dummy.rotation.set(0, d.age * 1.8 + d.id * 0.5, 0);
+      this._dummy.scale.set(1, 1, 1);
+      this._dummy.updateMatrix();
+      this._instancedMesh.setMatrixAt(i, this._dummy.matrix);
+      this._tmpColor.setHex(d.colorHex);
+      this._instancedMesh.setColorAt(i, this._tmpColor);
+    }
+
+    this._instancedMesh.instanceMatrix.needsUpdate = true;
+    if (this._instancedMesh.instanceColor) {
+      this._instancedMesh.instanceColor.needsUpdate = true;
+    }
   }
 
   /**
    * Removes all active item drops from world and scene.
    */
   clear() {
-    for (let i = this.drops.length - 1; i >= 0; i--) {
-      this._removeDropAt(i);
+    this.drops.length = 0;
+    if (this._instancedMesh) {
+      this._instancedMesh.count = 0;
     }
   }
 
   /**
-   * Releases shared geometries and drops.
+   * Releases shared geometries and instanced mesh.
    */
   dispose() {
     this.clear();
+    if (this._instancedMesh && this.scene) {
+      this.scene.remove(this._instancedMesh);
+    }
+    this._instancedMesh?.dispose();
+    this._instancedMesh = null;
     this._sharedGeometry?.dispose();
     this._sharedGeometry = null;
-  }
-
-  /** @private */
-  _removeDropAt(index) {
-    const d = this.drops[index];
-    if (d.mesh) {
-      this.scene?.remove(d.mesh);
-      if (Array.isArray(d.mesh.material)) {
-        d.mesh.material.forEach((m) => m.dispose());
-      } else {
-        d.mesh.material?.dispose();
-      }
-    }
-    this.drops.splice(index, 1);
-  }
-
-  /** @private */
-  _createDropMesh(itemId) {
-    const def = this.itemRegistry.get(itemId);
-    if (!def) return null;
-    if (!this._sharedGeometry) {
-      this._sharedGeometry = new THREE.BoxGeometry(0.28, 0.28, 0.28);
-    }
-    const mat = new THREE.MeshStandardMaterial({
-      color: def.color,
-      roughness: 0.72,
-      metalness: def.category === 'tool' ? 0.2 : 0.05,
-    });
-    const mesh = new THREE.Mesh(this._sharedGeometry, mat);
-    mesh.castShadow = true;
-    return mesh;
+    this._sharedMaterial?.dispose();
+    this._sharedMaterial = null;
   }
 }
